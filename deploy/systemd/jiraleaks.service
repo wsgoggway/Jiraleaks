@@ -1,0 +1,21 @@
+[Unit]
+Description=jiraleaks
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=jiraleaks
+EnvironmentFile=/etc/jiraleaks/env
+ExecStart=/usr/local/bin/jiraleaks \
+    --jira-url ${JIRA_URL} \
+    --auth bearer \
+    --jql "${JIRA_JQL}" \
+    --format all \
+    --no-proxy
+ExecStartPost=/bin/echo "Scan completed: $(date)"
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

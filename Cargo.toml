@@ -1,0 +1,56 @@
+[package]
+name = "jiraleaks"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.97"
+license = "MIT"
+description = "Scan Jira issues, comments, and attachments for leaked secrets and credentials"
+authors = ["AppSec Team"]
+repository = "https://github.com/appsec-team/jiraleaks"
+homepage = "https://github.com/appsec-team/jiraleaks"
+readme = "README.md"
+keywords = ["jira", "secrets", "security", "scanner", "appsec"]
+categories = ["command-line-utilities", "development-tools"]
+
+[lib]
+name = "jiraleaks"
+path = "src/lib.rs"
+
+[[bin]]
+name = "jiraleaks"
+path = "src/main.rs"
+
+[profile.release]
+lto = "thin"
+strip = true
+opt-level = 3
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "gzip", "blocking"] }
+httpdate = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+clap = { version = "4", features = ["derive", "env"] }
+clap_complete = "4"
+sha2 = "0.10"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter", "fmt"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+thiserror = "2"
+anyhow = "1"
+time = { version = "0.3", features = ["serde", "serde-well-known", "formatting", "parsing"] }
+fancy-regex = "0.13"
+url = "2"
+csv = "1"
+tokio-util = { version = "0.7", features = ["rt"] }
+indicatif = "0.18"
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio-rustls", "sqlite", "postgres", "any", "macros", "migrate"
+] }
+libsqlite3-sys = { version = "0.30", features = ["bundled"] }
+
+[dev-dependencies]
+wiremock = "0.6"
+tokio = { version = "1", features = ["full", "test-util"] }

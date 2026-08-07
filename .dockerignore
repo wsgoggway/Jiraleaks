@@ -1,0 +1,6 @@
+target/
+.git/
+.jiraleaks-state/
+reports/
+Dockerfile
+*.md

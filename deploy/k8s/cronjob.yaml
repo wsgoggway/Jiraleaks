@@ -1,0 +1,51 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: jiraleaks
+  namespace: security
+spec:
+  schedule: "0 3 * * 1"  # Every Monday at 03:00 UTC
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+            - name: scanner
+              image: registry.example.com/jiraleaks:latest
+              imagePullPolicy: Always
+              env:
+                - name: JIRA_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: jira-credentials
+                      key: url
+                - name: JIRA_PAT
+                  valueFrom:
+                    secretKeyRef:
+                      name: jira-credentials
+                      key: pat
+                - name: JIRA_JQL
+                  value: "project = SEC AND updated >= -7d"
+                - name: JIRA_NO_PROXY
+                  value: "1"
+                - name: REPORT_FORMAT
+                  value: "all"
+                - name: LOG_LEVEL
+                  value: "info"
+              resources:
+                requests:
+                  memory: "128Mi"
+                  cpu: "100m"
+                limits:
+                  memory: "512Mi"
+                  cpu: "500m"
+              volumeMounts:
+                - name: reports
+                  mountPath: /reports
+          volumes:
+            - name: reports
+              emptyDir: {}
+          restartPolicy: Never

@@ -1,0 +1,15 @@
+/target/
+/.jiraleaks-state/
+/reports/
+**/*.rs.bk
+# secrets / credentials — never commit
+.env*
+*.key
+*.pem
+*.pfx
+*.p12
+*.sqlite
+*.sqlite3
+*.db
+credentials*
+secrets*
