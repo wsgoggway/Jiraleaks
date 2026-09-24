@@ -654,3 +654,110 @@ async fn an_empty_db_url_disables_the_store_and_keeps_the_reports() {
         );
     }
 }
+
+// ── the remaining exit codes: 3 (critical scan) and 4 (report write) ────────
+
+/// Exit code 3: a failure that stops the scan. A search response the client
+/// cannot parse means the scanner does not know what it did not read, so the run
+/// must not end successfully — and no report may claim otherwise.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_malformed_search_response_exits_three() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/rest/api/2/serverInfo"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "baseUrl": server.uri(),
+            "version": "9.12.37",
+            "deploymentType": "Server",
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/rest/api/2/search"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("this is not a search page"))
+        .mount(&server)
+        .await;
+
+    let temp = TempDir::new("scan-critical");
+    let report_dir = temp.path().join("reports");
+    let args: Vec<String> = vec![
+        "--jira-url".into(),
+        server.uri(),
+        "--jql".into(),
+        "project = TEST".into(),
+        "--pat".into(),
+        "test-token".into(),
+        "--no-proxy".into(),
+        "--report-dir".into(),
+        report_dir.display().to_string(),
+        "--state-dir".into(),
+        temp.path().join("state").display().to_string(),
+    ];
+
+    let output = run_binary(args).await;
+    assert_eq!(
+        code(&output),
+        3,
+        "a malformed search response must be a critical scan error. stdout: {}",
+        stdout(&output)
+    );
+    assert!(
+        stdout(&output).contains("Failed to parse search results"),
+        "the failure must name the stage that broke: {}",
+        stdout(&output)
+    );
+    assert!(
+        !report_dir.exists(),
+        "an aborted scan must not leave a report behind"
+    );
+}
+
+/// Exit code 4: the scan ran to the end but the report could not be written.
+///
+/// The report directory is a regular *file* here, so `create_dir_all` fails on
+/// the first write. The point of the test is the code: a run whose findings
+/// never reached disk must not report success, and it must be distinguishable
+/// from the store failure above (code 5) — the two stages are different failures
+/// for the operator.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unwritable_report_directory_exits_four() {
+    let server = MockServer::start().await;
+    mount_jira(&server).await;
+
+    let temp = TempDir::new("report-write");
+    let blocked_report_dir = temp.path().join("reports");
+    std::fs::write(&blocked_report_dir, b"a file where a directory is needed")
+        .expect("write the blocker");
+
+    let args: Vec<String> = vec![
+        "--jira-url".into(),
+        server.uri(),
+        "--jql".into(),
+        "project = TEST".into(),
+        "--pat".into(),
+        "test-token".into(),
+        "--no-proxy".into(),
+        "--report-dir".into(),
+        blocked_report_dir.display().to_string(),
+        "--state-dir".into(),
+        temp.path().join("state").display().to_string(),
+    ];
+
+    let output = run_binary(args).await;
+    assert_eq!(
+        code(&output),
+        4,
+        "an unwritable report directory is a report write error. stdout: {}",
+        stdout(&output)
+    );
+    assert!(
+        stdout(&output).contains("Report write error"),
+        "the failure must name the report stage: {}",
+        stdout(&output)
+    );
+    // The store is a different stage and it did succeed: the run got past it.
+    assert!(
+        temp.path().join("state/findings.db").is_file(),
+        "the store is opened before the reports are written"
+    );
+}
