@@ -48,11 +48,12 @@ fn exact(prefix: &str, n: usize) -> String {
 /// The positive corpus: `(rule that must fire, sample)`.
 fn positives() -> Vec<(&'static str, String)> {
     vec![
-        // AWS key id: 4-character prefix + 16 uppercase alphanumerics.
-        (
-            "aws_access_key_id",
-            exact("AKIA", 16).to_uppercase(),
-        ),
+        // AWS key id: 4-character prefix + 16 characters of the AWS base32
+        // alphabet (`A-Z`, `2-7`). Not built from [`PAD`]: `PAD` contains `0`,
+        // `1`, `8` and `9`, which the rule's `aws_key_checksum` validator
+        // rejects, so a sample derived from it would exercise the validator
+        // rather than the rule.
+        ("aws_access_key_id", "AKIA234567ABCDEFGHIJ".to_string()),
         // AWS secret: exactly 40 characters, at least three digits, and the
         // keyword the rule requires within 50 bytes.
         (

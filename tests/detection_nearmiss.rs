@@ -84,11 +84,12 @@ fn charset_near_misses() -> Vec<(&'static str, &'static str, &'static str)> {
             "access key ASIAABCDEFGHIJKLMNOP end",
         ),
         // Same, with the prefix lowercased: the prefix alternation is
-        // case-sensitive.
+        // case-sensitive. The body is base32 (`A-Z`, `2-7`) so the control is
+        // rejected only by the case of its prefix and not by the validator.
         (
             "aws_access_key_id",
-            "access key asia1234567890ABCDEF end",
-            "access key ASIA1234567890ABCDEF end",
+            "access key asia234567ABCDEFGHIJ end",
+            "access key ASIA234567ABCDEFGHIJ end",
         ),
         // 20-character payload, but a `.` where the alphabet has none.
         (
@@ -315,24 +316,28 @@ fn rule_requirements_reject_the_value_that_satisfies_only_the_regex() {
     );
 }
 
-/// CHARACTERIZATION of a defect, not an endorsement: the `aws_key_checksum`
-/// validator documents the AWS alphabet as base32 (`A-Z, 2-7`) but its
-/// implementation accepts every uppercase letter and digit, so a key id
-/// containing `0`, `1`, `8` or `9` — which AWS never issues — is reported as a
-/// finding.
+/// The `aws_key_checksum` validator enforces the documented AWS alphabet:
+/// a 4-character prefix and 16 characters of base32 (`A-Z`, `2-7`), uppercase
+/// only.
 ///
-/// The assertion is written the way the code behaves today so that the defect is
-/// pinned and visible. When the validator starts enforcing the documented
-/// alphabet, this test must be inverted (see the QA report of the task that
-/// added it).
+/// The rule's regex is deliberately wider (`[0-9A-Z]{16}`), so a key id
+/// containing `0`, `1`, `8` or `9` — which AWS never issues — reaches the
+/// validator, and the validator is what rejects it. The control below is the same
+/// key id with alphabet digits: it is still a finding, so the rejection above
+/// comes from the alphabet and not from a rule that stopped matching.
 #[test]
-fn aws_key_with_non_base32_digits_is_reported_today() {
+fn aws_key_with_non_base32_digits_is_rejected() {
     let engine = engine();
     let non_base32 = "ASIA0000000000000000";
-    assert!(
-        hits(&engine, &format!("aws_access_key_id = {non_base32}"))
-            .contains(&"aws_access_key_id".to_string()),
-        "the validator changed: `{non_base32}` is no longer reported, invert this test"
+    assert_not_detected(
+        &engine,
+        "aws_access_key_id",
+        &format!("aws_access_key_id = {non_base32}"),
+    );
+    assert_detected(
+        &engine,
+        "aws_access_key_id",
+        "aws_access_key_id = ASIA2345672345672345",
     );
 }
 // ── ReDoS ───────────────────────────────────────────────────────────────────

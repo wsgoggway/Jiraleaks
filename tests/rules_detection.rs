@@ -22,7 +22,11 @@ fn assert_not_detects(rule_id: &str, text: &str) {
 #[test]
 fn aws_key_positive() {
     assert_detects("aws_access_key_id", "ASIAOZW6VBVAZFJHJLQA");
-    assert_detects("aws_access_key_id", "ASIA1234567890ABCDEF");
+    // 4-character prefix + 16 characters of the AWS alphabet (`A-Z`, `2-7`).
+    // `0`, `1`, `8` and `9` are outside that alphabet, and the
+    // `aws_key_checksum` validator rejects a key id containing one — see
+    // `tests/detection_nearmiss.rs`.
+    assert_detects("aws_access_key_id", "ASIA2345672345672345");
 }
 
 #[test]

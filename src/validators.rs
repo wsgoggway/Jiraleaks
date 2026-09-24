@@ -1,7 +1,7 @@
 /// Validator functions for confirming secret authenticity.
 ///
 /// Known validators:
-/// - `aws_key_checksum`: validates AWS access key ID checksum
+/// - `aws_key_checksum`: validates the AWS access key ID prefix and alphabet
 /// - `jwt_structure`: validates JWT has 3 base64url parts
 /// - `github_token_checksum`: validates GitHub PAT classic checksum (CRC32,
 ///   experimental — GitHub does not formally document the algorithm)
@@ -20,24 +20,36 @@ pub fn validate(validator: &str, value: &str) -> bool {
     }
 }
 
-/// AWS access key ID checksum validation.
-/// AKIA/ASIA etc. keys have a base32 checksum in the last characters.
+/// AWS access key ID validation: the four-character prefix names the credential
+/// type, and the sixteen characters after it are the AWS alphabet.
+///
+/// That alphabet is base32 — `A`–`Z` and `2`–`7`, uppercase only. The digits
+/// `0`, `1`, `8` and `9` are not in it, and AWS does not issue an access key id
+/// that contains them, so `ASIA0000000000000000` is a near miss and not a
+/// credential. The rule's regex (`[0-9A-Z]{16}`) is deliberately wider than the
+/// alphabet, because the validator is the layer that knows this — which is why
+/// the check has to be real here and not another uppercase-or-digit test.
 fn validate_aws_key(value: &str) -> bool {
-    // Must be exactly 20 chars: 4-char prefix + 16 base32 chars
-    if value.len() != 20 {
-        return false;
-    }
-    let prefix = &value[..4];
-    let valid_prefixes = [
+    // The prefixes AWS issues for access key ids, as the rule's regex lists them.
+    // A prefix in this list but not in the regex is a dead branch, and one in the
+    // regex but not here means every hit of that prefix is rejected — the test
+    // below keeps the two lists equal.
+    const VALID_PREFIXES: [&str; 9] = [
         "AKIA", "ASIA", "AGPA", "AIDA", "AROA", "AIPA", "ANPA", "ANVA", "ASCA",
     ];
-    if !valid_prefixes.contains(&prefix) {
+
+    // Must be exactly 20 chars: 4-char prefix + 16 base32 chars. The ASCII check
+    // guards the byte split below: without it a multi-byte character straddling
+    // the fourth byte would panic `split_at` instead of rejecting the value.
+    if value.len() != 20 || !value.is_ascii() {
         return false;
     }
-    // Remaining 16 chars must be valid base32 (A-Z, 2-7)
-    value[4..]
-        .chars()
-        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+    let (prefix, body) = value.split_at(4);
+    if !VALID_PREFIXES.contains(&prefix) {
+        return false;
+    }
+    body.bytes()
+        .all(|b| b.is_ascii_uppercase() || (b'2'..=b'7').contains(&b))
 }
 
 /// Validate JWT structure: 3 base64url-encoded segments separated by dots.
@@ -133,7 +145,67 @@ mod tests {
 
     #[test]
     fn test_aws_key_valid() {
-        assert!(validate_aws_key("AKIAIOSFODNN7EXAMPLE"));
+        for value in [
+            // The sample AWS documents.
+            "AKIAIOSFODNN7EXAMPLE",
+            // A real-shaped `ASIA` key id; `7` is the only digit, and it is in the
+            // alphabet.
+            "ASIAOZW6VBVAZFJHJLQA",
+            // Digits of the alphabet, and nothing else.
+            "ASIA2345672345672345",
+        ] {
+            assert!(validate_aws_key(value), "{value} must be accepted");
+        }
+    }
+
+    /// `0`, `1`, `8` and `9` are outside the AWS base32 alphabet, so a key id
+    /// containing one is not a key id. The regex accepts it, the validator is what
+    /// rejects it.
+    #[test]
+    fn test_aws_key_non_base32_digits_are_rejected() {
+        for digit in ["0", "1", "8", "9"] {
+            let value = format!("ASIA{}", digit.repeat(16));
+            assert!(!validate_aws_key(&value), "{value} must be rejected");
+        }
+    }
+
+    #[test]
+    fn test_aws_key_lowercase_body_is_rejected() {
+        assert!(!validate_aws_key("AKIAiosfodnn7example"));
+    }
+
+    /// A multi-byte character straddling the fourth byte must reject the value
+    /// rather than panic the slice that splits the prefix off.
+    #[test]
+    fn test_aws_key_multibyte_prefix_boundary_is_rejected() {
+        let value = format!("AKI\u{e4}{}", "A".repeat(15));
+        assert_eq!(value.len(), 20, "the value must pass the length check");
+        assert!(!validate_aws_key(&value));
+    }
+
+    /// The prefix list and the rule's regex must agree: every prefix the
+    /// validator accepts has to be one the builtin rule matches, and every value
+    /// built from it has to survive the rule's whole filter chain.
+    #[test]
+    fn test_aws_key_prefixes_match_the_builtin_rule() {
+        let engine = crate::rules::RulesEngine::new(None).expect("builtin rules load");
+        for prefix in [
+            "AKIA", "ASIA", "AGPA", "AIDA", "AROA", "AIPA", "ANPA", "ANVA", "ASCA",
+        ] {
+            let value = format!("{prefix}2345672345672345");
+            assert!(
+                validate_aws_key(&value),
+                "the validator rejects its own prefix {prefix}"
+            );
+            assert!(
+                engine
+                    .scan(&value, "test_field")
+                    .iter()
+                    .any(|hit| hit.rule_id == "aws_access_key_id"),
+                "the builtin rule does not accept the prefix {prefix}: the validator is \
+                 stricter than the regex, so every hit of that prefix is rejected"
+            );
+        }
     }
 
     #[test]
