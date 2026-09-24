@@ -4,7 +4,8 @@ use std::path::Path;
 use serde::Serialize;
 
 use crate::error::ScannerError;
-use crate::finding::{Finding, FindingStatus, Severity};
+use crate::finding::{Finding, FindingKey, FindingStatus, Severity};
+use crate::report::ReportInput;
 use serde_json::json;
 
 /// A finding in DefectDojo "Generic Findings Import" JSON format.
@@ -29,14 +30,13 @@ struct DefectDojoFinding {
 }
 
 /// Write findings as a DefectDojo Generic Findings Import JSON document.
-pub fn write(path: &Path, findings: &[Finding]) -> Result<(), ScannerError> {
+pub fn write(path: &Path, input: &ReportInput<'_>) -> Result<(), ScannerError> {
     let output = json!({
-        "findings": findings.iter().map(map_finding).collect::<Vec<_>>(),
+        "findings": input.findings.iter().map(map_finding).collect::<Vec<_>>(),
     });
 
-    let json_str = serde_json::to_string_pretty(&output).map_err(|e| {
-        ScannerError::ReportWrite(format!("DefectDojo serialization error: {e}"))
-    })?;
+    let json_str = serde_json::to_string_pretty(&output)
+        .map_err(|e| ScannerError::ReportWrite(format!("DefectDojo serialization error: {e}")))?;
 
     fs::write(path, json_str).map_err(|e| {
         ScannerError::ReportWrite(format!("Failed to write DefectDojo report: {e}"))
@@ -56,7 +56,58 @@ fn status_label(s: FindingStatus) -> &'static str {
     }
 }
 
+/// Stable id of ONE location of a finding: `{fingerprint}#{ordinal}`.
+///
+/// The ordinal disambiguates locations that share a fingerprint — the same
+/// secret and rule reached from two field paths of one issue produce identical
+/// fingerprints, and a bare fingerprint would let those locations collide.
+fn location_unique_id(key: &FindingKey, ordinal: usize) -> String {
+    format!("{}#{ordinal}", key.fingerprint())
+}
+
+/// Stable `unique_id_from_tool` of a finding's DefectDojo record.
+///
+/// Format: `fp:<64 hex>#<ordinal>` — the location fingerprint
+/// ([`FindingKey::fingerprint`]) of the finding's primary (first) location,
+/// followed by that location's ordinal in the finding's location list, so it
+/// reads as `fp:1f0c…a9#0`.
+///
+/// Why not `finding_id`: that is a UUID v4 regenerated on every scan, so
+/// DefectDojo imports each scan as a brand-new finding and never closes the
+/// ones that were fixed. The fingerprint is derived from
+/// `(secret_hash, rule_id, issue_key)` and therefore identical on every scan of
+/// the same state, which is what DefectDojo matches on to update an existing
+/// record and to close a finding that stopped being reported.
+///
+/// The primary location is used rather than a hash of the whole location list
+/// on purpose: it stays stable when a re-scan discovers the same secret in an
+/// additional issue (the record keeps its identity and gains a location), while
+/// two findings that differ in their first location keep distinct ids. The
+/// ordinal is 0 for the primary location; see [`location_unique_id`] for what it
+/// is for.
+pub(crate) fn unique_id_from_tool(finding: &Finding) -> String {
+    let keys = finding.location_keys();
+    let primary = keys.first().cloned().unwrap_or_else(|| finding.key());
+    location_unique_id(&primary, 0)
+}
+
 fn map_finding(f: &Finding) -> DefectDojoFinding {
+    // What the three boolean flags mean, and why they are derived this way:
+    //
+    // * `verified` — DefectDojo's "a human or a system confirmed this is real"; it
+    //   moves the finding out of the triage queue. A rule match is a *candidate*,
+    //   not a confirmation, so the only confirmation this scanner can honestly
+    //   claim is an external validation that says the credential is live
+    //   (`external_validation.valid`). Importing candidates as verified put every
+    //   unconfirmed hit into the verified bucket and hid the triage work that the
+    //   findings exist to trigger.
+    // * `active` — "still to be worked on". Closed, Resolved and FalsePositive all
+    //   say the opposite; New, Recurring and Confirmed are active.
+    // * `false_p` — the scanner already decided the finding is not a real leak.
+    //
+    // `active` and `false_p` are therefore mutually exclusive: a false positive is
+    // imported inactive. Previously both were true at once, which re-opened a
+    // finding the scan itself had dismissed.
     let live_validated = f
         .external_validation
         .as_ref()
@@ -115,12 +166,15 @@ fn map_finding(f: &Finding) -> DefectDojoFinding {
         mitigation: "Rotate the exposed credential, remove it from the Jira issue, and review who had access to the issue while it was exposed.".into(),
         references: f.issue_url.clone(),
         file_path: f.issue_key.clone(),
-        active: f.status != FindingStatus::Resolved && f.status != FindingStatus::Closed,
-        verified: true,
+        active: !matches!(
+            f.status,
+            FindingStatus::Closed | FindingStatus::Resolved | FindingStatus::FalsePositive
+        ),
+        verified: live_validated,
         false_p: f.status == FindingStatus::FalsePositive,
         duplicate: false,
         static_finding: true,
-        unique_id_from_tool: f.finding_id.clone(),
+        unique_id_from_tool: unique_id_from_tool(f),
         tags,
     }
 }
@@ -138,7 +192,43 @@ fn severity_to_dd(severity: &Severity) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::finding::{Confidence, Location, SourceType};
+    use crate::finding::{Confidence, Location, ScanRun, ScanStatus, SourceType};
+
+    fn scan_run() -> ScanRun {
+        ScanRun {
+            scan_id: "scan-1".into(),
+            status: ScanStatus::Success,
+            started_at: "2026-01-01T00:00:00Z".into(),
+            finished_at: "2026-01-01T00:00:01Z".into(),
+            jira_url: "https://jira".into(),
+            jql: "project = SEC".into(),
+            issues_scanned: 1,
+            issues_total: 1,
+            findings_total: 1,
+            findings_critical: 0,
+            findings_high: 1,
+            findings_medium: 0,
+            findings_low: 0,
+            findings_info: 0,
+            errors_total: 0,
+            comments_scanned: 0,
+            attachments_scanned: 0,
+            scanner_version: "0.1.0".into(),
+            duration_secs: 0.0,
+        }
+    }
+
+    /// A DefectDojo writer ignores the scan metadata; it needs the input only to
+    /// keep the one signature the whole catalogue shares.
+    fn write_dd(path: &Path, findings: &[Finding]) -> Result<(), ScannerError> {
+        write(
+            path,
+            &ReportInput {
+                scan_run: &scan_run(),
+                findings,
+            },
+        )
+    }
 
     fn sample_finding(status: FindingStatus) -> Finding {
         Finding {
@@ -169,6 +259,11 @@ mod tests {
         }
     }
 
+    fn with_finding_id(mut f: Finding, finding_id: &str) -> Finding {
+        f.finding_id = finding_id.into();
+        f
+    }
+
     #[test]
     fn severity_is_capitalized_for_defectdojo() {
         assert_eq!(severity_to_dd(&Severity::Critical), "Critical");
@@ -184,21 +279,24 @@ mod tests {
         assert_eq!(dd.title, "aws-access-key in SEC-42");
         assert_eq!(dd.severity, "High");
         assert_eq!(dd.file_path, "SEC-42");
-        assert_eq!(dd.unique_id_from_tool, "f-123");
+        assert_eq!(
+            dd.unique_id_from_tool,
+            "fp:b3180ab374142f1599ac15ea04c5fd167ba1a1340d4492f801857a24035fae45#0"
+        );
         assert!(dd.active);
-        assert!(dd.verified);
+        // No external validation on this finding, so nothing confirmed it: DefectDojo
+        // must show it as an active but UNverified finding, i.e. triage work.
+        assert!(
+            !dd.verified,
+            "a rule match is a candidate, not a confirmed finding"
+        );
         assert!(!dd.false_p);
         assert!(dd.static_finding);
         assert!(dd.description.contains("AKIA********EXAMPLE"));
         assert!(dd.description.contains("https://jira/browse/SEC-42"));
         assert_eq!(
             dd.tags,
-            vec![
-                "jira",
-                "secret-scanner",
-                "description",
-                "status:confirmed"
-            ]
+            vec!["jira", "secret-scanner", "description", "status:confirmed"]
         );
         assert!(dd.description.contains("Status: confirmed"));
     }
@@ -207,7 +305,10 @@ mod tests {
     fn false_positive_and_resolved_statuses() {
         let fp = map_finding(&sample_finding(FindingStatus::FalsePositive));
         assert!(fp.false_p);
-        assert!(fp.active);
+        // A false positive is not work: it is imported inactive, not as an active
+        // false-positive the triager would meet again in the queue.
+        assert!(!fp.active, "a false positive must not be imported active");
+        assert!(!fp.verified);
         let resolved = map_finding(&sample_finding(FindingStatus::Resolved));
         assert!(!resolved.active);
         assert!(!resolved.false_p);
@@ -233,6 +334,7 @@ mod tests {
         });
         let dd = map_finding(&f);
         assert!(dd.tags.contains(&"live-validated".to_string()));
+        assert!(dd.verified, "a live validation confirms the finding");
         assert!(dd.description.contains("First seen: 2026-01-01T00:00:00Z"));
         assert!(dd.description.contains("Times seen: 3"));
         assert!(dd.description.contains("External validation: valid=true"));
@@ -243,7 +345,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("dd-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("report.json");
-        write(&path, &[sample_finding(FindingStatus::New)]).unwrap();
+        write_dd(&path, &[sample_finding(FindingStatus::New)]).unwrap();
         let doc: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         std::fs::remove_dir_all(&dir).ok();
@@ -252,5 +354,123 @@ mod tests {
         assert_eq!(findings[0]["severity"], "High");
         assert_eq!(findings[0]["title"], "aws-access-key in SEC-42");
         assert_eq!(findings[0]["active"], true);
+        assert_eq!(findings[0]["verified"], false);
+        assert_eq!(findings[0]["false_p"], false);
+    }
+
+    // --- stable unique_id_from_tool ---
+
+    #[test]
+    fn unique_id_is_the_primary_location_fingerprint() {
+        let f = sample_finding(FindingStatus::New);
+        // Golden: fp = sha256("deadbeef\x1faws-access-key\x1fSEC-42").
+        assert_eq!(
+            unique_id_from_tool(&f),
+            "fp:b3180ab374142f1599ac15ea04c5fd167ba1a1340d4492f801857a24035fae45#0"
+        );
+    }
+
+    #[test]
+    fn unique_id_is_stable_across_scans_with_fresh_finding_ids() {
+        // Two scans of the same state mint different random finding_ids; the
+        // DefectDojo identity must not follow them.
+        let first = with_finding_id(
+            sample_finding(FindingStatus::New),
+            "11111111-1111-4111-8111-111111111111",
+        );
+        let second = with_finding_id(
+            sample_finding(FindingStatus::New),
+            "22222222-2222-4222-8222-222222222222",
+        );
+        assert_ne!(first.finding_id, second.finding_id);
+        assert_eq!(unique_id_from_tool(&first), unique_id_from_tool(&second));
+    }
+
+    #[test]
+    fn unique_id_is_stable_across_two_written_reports() {
+        let dir = std::env::temp_dir().join(format!("dd-stable-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let first = dir.join("scan1.json");
+        let second = dir.join("scan2.json");
+        write_dd(
+            &first,
+            &[with_finding_id(
+                sample_finding(FindingStatus::New),
+                "uuid-a",
+            )],
+        )
+        .unwrap();
+        write_dd(
+            &second,
+            &[with_finding_id(
+                sample_finding(FindingStatus::New),
+                "uuid-b",
+            )],
+        )
+        .unwrap();
+        let read_id = |path: &Path| -> String {
+            let doc: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+            doc["findings"][0]["unique_id_from_tool"]
+                .as_str()
+                .expect("unique_id_from_tool")
+                .to_string()
+        };
+        let (a, b) = (read_id(&first), read_id(&second));
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(a, b);
+        assert!(a.starts_with("fp:"), "got {a}");
+        assert!(a.ends_with("#0"), "got {a}");
+    }
+
+    #[test]
+    fn unique_id_differs_when_the_primary_location_differs() {
+        let base = with_finding_id(sample_finding(FindingStatus::New), "same-id");
+        let mut elsewhere = with_finding_id(sample_finding(FindingStatus::New), "same-id");
+        elsewhere.issue_key = "SEC-43".into();
+        elsewhere.locations = vec![Location {
+            issue_key: "SEC-43".into(),
+            field_path: "fields.description".into(),
+            source_type: SourceType::Description,
+        }];
+        assert_ne!(unique_id_from_tool(&base), unique_id_from_tool(&elsewhere));
+    }
+
+    #[test]
+    fn unique_id_survives_an_extra_location() {
+        // A later scan that finds the same secret in one more issue keeps the
+        // record's identity: only the primary location decides it.
+        let base = sample_finding(FindingStatus::New);
+        let mut extended = sample_finding(FindingStatus::New);
+        extended.locations.push(Location {
+            issue_key: "SEC-99".into(),
+            field_path: "comment[3].body".into(),
+            source_type: SourceType::Comment,
+        });
+        assert_eq!(unique_id_from_tool(&base), unique_id_from_tool(&extended));
+    }
+
+    #[test]
+    fn unique_id_without_locations_uses_the_findings_own_issue() {
+        let mut f = sample_finding(FindingStatus::New);
+        f.locations.clear();
+        assert_eq!(
+            unique_id_from_tool(&f),
+            format!("{}#0", f.key().fingerprint())
+        );
+    }
+
+    #[test]
+    fn location_ordinal_disambiguates_locations_sharing_a_fingerprint() {
+        // One secret, one rule, one issue, two field paths: the two locations
+        // share a fingerprint, so only the ordinal separates their ids.
+        let a = FindingKey::new("deadbeef", "aws-access-key", "SEC-42");
+        let b = FindingKey::new("deadbeef", "aws-access-key", "SEC-42");
+        assert_eq!(a.fingerprint(), b.fingerprint());
+        assert_ne!(location_unique_id(&a, 0), location_unique_id(&b, 1));
+        assert_eq!(
+            location_unique_id(&a, 0),
+            unique_id_from_tool(&sample_finding(FindingStatus::New))
+        );
     }
 }

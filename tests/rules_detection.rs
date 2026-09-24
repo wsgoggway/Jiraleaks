@@ -22,7 +22,11 @@ fn assert_not_detects(rule_id: &str, text: &str) {
 #[test]
 fn aws_key_positive() {
     assert_detects("aws_access_key_id", "ASIAOZW6VBVAZFJHJLQA");
-    assert_detects("aws_access_key_id", "ASIA1234567890ABCDEF");
+    // 4-character prefix + 16 characters of the AWS alphabet (`A-Z`, `2-7`).
+    // `0`, `1`, `8` and `9` are outside that alphabet, and the
+    // `aws_key_checksum` validator rejects a key id containing one — see
+    // `tests/detection_nearmiss.rs`.
+    assert_detects("aws_access_key_id", "ASIA2345672345672345");
 }
 
 #[test]
@@ -34,13 +38,19 @@ fn aws_key_negative() {
 // ── aws_secret_access_key ──
 #[test]
 fn aws_secret_positive() {
-    assert_detects("aws_secret_access_key", "aws_secret_access_key = 3lyTWqHMt5UySny2drdPYheRTEzrNux8Cn5JWFHL");
+    assert_detects(
+        "aws_secret_access_key",
+        "aws_secret_access_key = 3lyTWqHMt5UySny2drdPYheRTEzrNux8Cn5JWFHL",
+    );
 }
 
 #[test]
 fn aws_secret_negative() {
     assert_not_detects("aws_secret_access_key", "short");
-    assert_not_detects("aws_secret_access_key", "no-context-here-abcdefghijklmnopqrstuvwxyz0123");
+    assert_not_detects(
+        "aws_secret_access_key",
+        "no-context-here-abcdefghijklmnopqrstuvwxyz0123",
+    );
 }
 
 // ── github_token ──
@@ -81,7 +91,10 @@ fn gitlab_token_negative() {
 // ── slack_token ──
 #[test]
 fn slack_token_positive() {
-    assert_detects("slack_token", "xoxb-123456789012-123456789012-abcdefghijklmnopqrstuvwx");
+    assert_detects(
+        "slack_token",
+        "xoxb-123456789012-123456789012-abcdefghijklmnopqrstuvwx",
+    );
 }
 
 #[test]
@@ -138,7 +151,10 @@ fn telegram_token_negative() {
 // ── stripe_key ──
 #[test]
 fn stripe_key_positive() {
-    assert_detects("stripe_key", "sk_live_51H2jYkL4N8pQ3rS6tU9vW1xZ4aB7cD0eF3gH5iJ6kL");
+    assert_detects(
+        "stripe_key",
+        "sk_live_51H2jYkL4N8pQ3rS6tU9vW1xZ4aB7cD0eF3gH5iJ6kL",
+    );
     assert_detects("stripe_key", "rk_test_abcdefghijklmnopqrstuvwx");
 }
 
@@ -150,7 +166,10 @@ fn stripe_key_negative() {
 // ── npm_token ──
 #[test]
 fn npm_token_positive() {
-    assert_detects("npm_token", "npm_1A2b3C4d5E6f7G8h9I0jK1lM2nO3pQ4r5S6t7U8v9W");
+    assert_detects(
+        "npm_token",
+        "npm_1A2b3C4d5E6f7G8h9I0jK1lM2nO3pQ4r5S6t7U8v9W",
+    );
 }
 
 #[test]
@@ -161,7 +180,10 @@ fn npm_token_negative() {
 // ── sendgrid_api_key ──
 #[test]
 fn sendgrid_key_positive() {
-    assert_detects("sendgrid_api_key", "SG.1A2b3C4d5E6f7G8h9I0.1A2b3C4d5E6f7G8h9I0jK1lM2nO3p");
+    assert_detects(
+        "sendgrid_api_key",
+        "SG.1A2b3C4d5E6f7G8h9I0.1A2b3C4d5E6f7G8h9I0jK1lM2nO3p",
+    );
 }
 
 #[test]
@@ -172,9 +194,18 @@ fn sendgrid_key_negative() {
 // ── db_url_credentials ──
 #[test]
 fn db_url_creds_positive() {
-    assert_detects("db_url_credentials", "postgres://user:secretpass@db.corp.internal/mydb");
-    assert_detects("db_url_credentials", "mysql://admin:p@ssw0rd@localhost:3306/db");
-    assert_detects("db_url_credentials", "mongodb://root:toor@cluster0.mongodb.net/appdb");
+    assert_detects(
+        "db_url_credentials",
+        "postgres://user:secretpass@db.corp.internal/mydb",
+    );
+    assert_detects(
+        "db_url_credentials",
+        "mysql://admin:p@ssw0rd@localhost:3306/db",
+    );
+    assert_detects(
+        "db_url_credentials",
+        "mongodb://root:toor@cluster0.mongodb.net/appdb",
+    );
 }
 
 #[test]
@@ -196,7 +227,10 @@ fn generic_password_negative() {
 // ── generic_api_key_assignment ──
 #[test]
 fn generic_api_key_positive() {
-    assert_detects("generic_api_key_assignment", "api_key = abcdefghijklmnopqrstuvwxyz123456");
+    assert_detects(
+        "generic_api_key_assignment",
+        "api_key = abcdefghijklmnopqrstuvwxyz123456",
+    );
 }
 
 #[test]
@@ -218,7 +252,10 @@ fn generic_secret_negative() {
 // ── basic_auth_header ──
 #[test]
 fn basic_auth_positive() {
-    assert_detects("basic_auth_header", "Authorization: Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==");
+    assert_detects(
+        "basic_auth_header",
+        "Authorization: Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==",
+    );
 }
 
 #[test]
@@ -229,7 +266,10 @@ fn basic_auth_negative() {
 // ── bearer_token_generic ──
 #[test]
 fn bearer_token_positive() {
-    assert_detects("bearer_token_generic", "Authorization: Bearer abcdefghijklmnopqrstuvwxyz1234567890");
+    assert_detects(
+        "bearer_token_generic",
+        "Authorization: Bearer abcdefghijklmnopqrstuvwxyz1234567890",
+    );
 }
 
 #[test]

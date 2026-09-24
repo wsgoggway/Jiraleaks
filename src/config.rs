@@ -2,10 +2,74 @@ use std::fmt;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
-use serde::{Deserialize, Serialize};
+
+/// Log level used when neither `--log-level`/`LOG_LEVEL` nor `RUST_LOG` is set.
+///
+/// See [`crate::log::resolve_filter`] for the priority rules, and
+/// [`Config::effective_log_level`].
+pub const DEFAULT_LOG_LEVEL: &str = "info";
+
+/// Format of the file written to `--metrics-path`.
+///
+/// A typed enum rather than a string: the CLI used to accept `text`, which no
+/// writer implemented — it silently produced JSON — while `prom`, the only
+/// spelling the Prometheus writer understood, was rejected. Parsing into this
+/// enum makes the accepted values and the writers agree by construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MetricsFormat {
+    /// `--metrics-format json`, the default
+    #[default]
+    Json,
+    /// `--metrics-format prom` or `--metrics-format prometheus`
+    Prometheus,
+}
+
+impl MetricsFormat {
+    /// Case-insensitive parse of the accepted CLI spellings.
+    ///
+    /// `json`, `prom` and `prometheus` are accepted; `prom` is the historical
+    /// short spelling and is reported back as `prometheus`. Anything else —
+    /// including the retired `text` — is an error.
+    pub fn parse_opt(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "json" => Some(MetricsFormat::Json),
+            "prom" | "prometheus" => Some(MetricsFormat::Prometheus),
+            _ => None,
+        }
+    }
+
+    /// Canonical, lowercase name of the format (what `--help` shows).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MetricsFormat::Json => "json",
+            MetricsFormat::Prometheus => "prometheus",
+        }
+    }
+}
+
+impl std::str::FromStr for MetricsFormat {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse_opt(s).ok_or_else(|| {
+            format!("unknown metrics format '{s}', expected one of: json, prom, prometheus")
+        })
+    }
+}
+
+impl fmt::Display for MetricsFormat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 
 /// jiraleaks — CLI configuration.
-#[derive(Parser, Clone, Serialize, Deserialize)]
+///
+/// Environment handling: clap reads the environment for most options (see the
+/// `env` attributes), except the personal access token, whose three sources are
+/// resolved by [`Config::resolve_pat_from_env`] — call it after parsing when the
+/// process environment has to be honoured.
+#[derive(Parser, Clone)]
 #[command(
     name = "jiraleaks",
     version = env!("CARGO_PKG_VERSION"),
@@ -21,14 +85,16 @@ pub struct Config {
     #[arg(long, env = "JIRA_AUTH", default_value = "bearer", value_parser = ["bearer", "basic", "none"])]
     pub auth: String,
 
-    /// Personal access token (or API token for basic auth)
-    #[arg(long, env = "JIRA_PAT", alias = "JIRA_API_TOKEN", default_value = "", hide_default_value = true)]
-    #[serde(skip_serializing)]
+    /// Personal access token (or API token for basic auth).
+    ///
+    /// Taken from the first of `--pat`, `JIRA_PAT`, `JIRA_API_TOKEN`; the
+    /// environment fallbacks are applied by `Config::resolve_pat_from_env`, which
+    /// the binary calls right after parsing.
+    #[arg(long, default_value = "", hide_default_value = true)]
     pat: String,
 
     /// Email for basic auth
     #[arg(long, env = "JIRA_EMAIL")]
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
 
     /// JQL query to select issues to scan
@@ -55,7 +121,13 @@ pub struct Config {
     #[arg(long, env = "SCAN_COMMENTS_MODE", default_value = "all", value_parser = ["none", "all"])]
     pub comments_mode: String,
 
-    /// Scan attachments (experimental)
+    /// Scan the bodies of text attachments, on top of the issue text
+    ///
+    /// Off by default. When enabled, an attachment whose extension or MIME type
+    /// marks it as text is downloaded and scanned like any other text; archives,
+    /// images, PDFs, office documents and binaries are never fetched. Bounded by
+    /// `--max-attachment-size-mb` per file, and by 20 attachments / 32 MiB per
+    /// issue.
     #[arg(long, env = "SCAN_ATTACHMENTS_ENABLED", default_value = "false")]
     pub scan_attachments: bool,
 
@@ -108,31 +180,30 @@ pub struct Config {
     /// State directory for checkpoints
     #[arg(long, default_value = "./.jiraleaks-state")]
     pub state_dir: PathBuf,
+
     /// Database URL for findings store (sqlite:///path?mode=rwc or postgres://...).
     /// Empty string disables the store. Default: sqlite://{state_dir}/findings.db?mode=rwc
     #[arg(long, env = "JIRALEAKS_DB_URL")]
-    #[serde(skip_serializing)]
     pub db_url: Option<String>,
 
     /// Write metrics to this path
     #[arg(long)]
     pub metrics_path: Option<PathBuf>,
 
-    /// Metrics file format: json or text
-    #[arg(long, default_value = "json", value_parser = ["json", "text"])]
-    pub metrics_format: String,
+    /// Metrics file format: json, prom, or prometheus (default: json)
+    #[arg(long, default_value_t = MetricsFormat::default(), value_parser = clap::value_parser!(MetricsFormat))]
+    pub metrics_format: MetricsFormat,
 
-    /// Log level: trace, debug, info, warn, error
-    #[arg(long, env = "LOG_LEVEL", default_value = "info", value_parser = ["trace", "debug", "info", "warn", "error"])]
-    pub log_level: String,
+    /// Log level: trace, debug, info, warn, error (default: info).
+    ///
+    /// When neither this flag nor `LOG_LEVEL` is given, `RUST_LOG` is used as a
+    /// fallback; an explicitly configured level always wins over `RUST_LOG`.
+    #[arg(long, env = "LOG_LEVEL", value_parser = ["trace", "debug", "info", "warn", "error"])]
+    pub log_level: Option<String>,
 
     /// Bypass proxy settings for Jira requests
     #[arg(long, env = "JIRA_NO_PROXY", default_value = "false")]
     pub no_proxy: bool,
-
-    /// Load base configuration from a YAML file
-    #[arg(long)]
-    pub config: Option<PathBuf>,
 
     /// Send alerts (Slack/Teams/webhook) after the scan
     #[arg(long)]
@@ -140,7 +211,6 @@ pub struct Config {
 
     /// Auxiliary CLI commands
     #[command(subcommand)]
-    #[serde(skip)]
     command: Option<CliCommand>,
 }
 
@@ -156,20 +226,100 @@ enum CliCommand {
 }
 
 /// Validate the report format list: comma-separated known formats.
+///
+/// The names come from [`crate::report::FORMAT_NAMES`], the same table the report
+/// writers are dispatched from, so `--format` can no longer accept a name that
+/// nothing writes (or reject one that something does). `all` is accepted here and
+/// leaves the expansion to `report::resolve_formats`, which owns it.
 fn parse_formats(s: &str) -> Result<String, String> {
-    const VALID: &[&str] = &[
-        "json", "ndjson", "csv", "sarif", "summary", "defectdojo", "all",
-    ];
     for f in s.split(',') {
         let f = f.trim();
-        if f.is_empty() || !VALID.contains(&f) {
+        if f.is_empty() || !accepted_format(f) {
             return Err(format!(
-                "unknown report format '{f}', expected one of: {}",
-                VALID.join(", ")
+                "unknown report format '{f}', expected one of: {}, all",
+                crate::report::FORMAT_NAMES.join(", ")
             ));
         }
     }
     Ok(s.to_string())
+}
+
+/// Whether `--format` accepts this single (already trimmed) name.
+fn accepted_format(name: &str) -> bool {
+    name == "all" || crate::report::FORMAT_NAMES.contains(&name)
+}
+
+/// Resolve the personal access token from its three sources.
+///
+/// Priority, highest first:
+/// 1. the `--pat` flag,
+/// 2. the `JIRA_PAT` environment variable,
+/// 3. the legacy `JIRA_API_TOKEN` environment variable, which the README has
+///    always documented as an alias.
+///
+/// A candidate that is absent, empty or whitespace-only counts as not set, so an
+/// empty variable (`JIRA_PAT=` left in a shell profile) cannot shadow a real
+/// token from a lower-priority source. Non-empty candidates are returned
+/// verbatim — only the emptiness test ignores surrounding whitespace.
+///
+/// Pure function: the caller passes the three candidates, so the precedence is
+/// testable without touching the process environment.
+pub fn resolve_pat(
+    cli: Option<String>,
+    env_pat: Option<String>,
+    env_alias: Option<String>,
+) -> Option<String> {
+    fn present(value: Option<String>) -> Option<String> {
+        value.filter(|v| !v.trim().is_empty())
+    }
+
+    present(cli)
+        .or_else(|| present(env_pat))
+        .or_else(|| present(env_alias))
+}
+
+/// Single source of truth for every default value of [`Config`].
+///
+/// The `default_value`s declared in the `clap` attributes above must agree with
+/// these values: a library caller that builds `Config::default()` and the binary
+/// must see the same configuration. `tests/config_cli.rs` pins both sets (and the
+/// README table), so a divergence fails the build instead of silently giving the
+/// integration tests a different configuration than production.
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            jira_url: String::new(),
+            auth: "bearer".to_string(),
+            pat: String::new(),
+            email: None,
+            jql: None,
+            page_size: 50,
+            max_issues: 0,
+            concurrency: 2,
+            fields: "*navigable".to_string(),
+            comments_mode: "all".to_string(),
+            scan_attachments: false,
+            max_attachment_size_mb: 10,
+            max_text_size_kb: 2048,
+            max_findings_per_issue: 1000,
+            allowlist: None,
+            rules: None,
+            min_confidence: "low".to_string(),
+            format: "json".to_string(),
+            report_dir: PathBuf::from("./reports"),
+            report_layout: "flat".to_string(),
+            dry_run: false,
+            incremental: false,
+            state_dir: PathBuf::from("./.jiraleaks-state"),
+            db_url: None,
+            metrics_path: None,
+            metrics_format: MetricsFormat::Json,
+            log_level: None,
+            no_proxy: false,
+            alerts: None,
+            command: None,
+        }
+    }
 }
 
 impl Config {
@@ -221,63 +371,168 @@ impl Config {
         30
     }
 
+    /// Effective log level: the configured one, or [`DEFAULT_LOG_LEVEL`].
+    ///
+    /// `log_level` is `None` exactly when neither `--log-level` nor `LOG_LEVEL`
+    /// was given — that is what lets `RUST_LOG` act as a fallback
+    /// ([`crate::log::resolve_filter`]) instead of being silently overridden by a
+    /// default, which is what used to happen.
+    pub fn effective_log_level(&self) -> &str {
+        self.log_level.as_deref().unwrap_or(DEFAULT_LOG_LEVEL)
+    }
+
+    /// Fill in the personal access token from the environment.
+    ///
+    /// The whole precedence (`--pat` > `JIRA_PAT` > `JIRA_API_TOKEN`) lives in
+    /// [`resolve_pat`]; this method only feeds it the three candidates and stores
+    /// the winner. The token is read here rather than by clap because clap cannot
+    /// express a fallback chain — the previous `alias = "JIRA_API_TOKEN"` was an
+    /// alias for the *argument name* (a hidden `--JIRA_API_TOKEN` flag) and never
+    /// looked at the environment, so the documented env alias was silently
+    /// ignored.
+    ///
+    /// Called by the binary right after parsing. An embedder that parses `Config`
+    /// itself must call it too, or `JIRA_PAT` / `JIRA_API_TOKEN` will not be read.
+    pub fn resolve_pat_from_env(&mut self) {
+        let cli = if self.pat.trim().is_empty() {
+            None
+        } else {
+            Some(self.pat.clone())
+        };
+        self.pat = resolve_pat(
+            cli,
+            std::env::var("JIRA_PAT").ok(),
+            std::env::var("JIRA_API_TOKEN").ok(),
+        )
+        .unwrap_or_default();
+    }
+
     /// Create a Config for testing purposes.
+    ///
+    /// Built on [`Config::default`], so production and tests cannot drift: only
+    /// the values a test must not inherit are overridden — a throwaway report and
+    /// state directory under `/tmp`, the credentials under test, the isolation
+    /// flags `dry_run` (never write reports) and `no_proxy` (the mock Jira server
+    /// is always local), and `concurrency: 1` for deterministic ordering.
     #[doc(hidden)]
     pub fn test_config(jira_url: &str, pat_token: &str) -> Self {
         Self {
             jira_url: jira_url.to_string(),
-            auth: "bearer".to_string(),
             pat: pat_token.to_string(),
-            email: None,
             jql: Some("project = TEST".into()),
-            page_size: 50,
-            max_issues: 0,
             concurrency: 1,
-            fields: "*navigable".into(),
-            comments_mode: "all".into(),
-            scan_attachments: false,
-            max_attachment_size_mb: 10,
-            max_text_size_kb: 2048,
-            max_findings_per_issue: 1000,
-            allowlist: None,
-            rules: None,
-            min_confidence: "low".into(),
-            format: "json".into(),
             report_dir: "/tmp/jiraleaks-test".into(),
-            report_layout: "flat".into(),
             dry_run: true,
-            incremental: false,
             state_dir: "/tmp/jiraleaks-test-state".into(),
-            metrics_path: None,
-            metrics_format: "json".into(),
-            db_url: None,
-            log_level: "info".into(),
             no_proxy: true,
-            config: None,
-            alerts: None,
-            command: None,
+            ..Self::default()
         }
     }
 
+    /// Validate the configuration, reporting the first violated rule.
+    ///
+    /// This is where the whole configuration contract is enforced, not only in
+    /// clap's `value_parser`s: a `Config` built by a library caller or by a test
+    /// never goes through clap, and a value that reaches a scan must be rejected
+    /// identically either way. clap still rejects the same values at parse time
+    /// (as a parse error, exit code 1); this function is the library-level
+    /// guarantee behind it. Every message names the offending value.
+    ///
+    /// `metrics_format` has no check here on purpose: it is a typed
+    /// [`MetricsFormat`], so an unrepresentable format cannot reach validation.
     pub fn validate(&self) -> Result<(), crate::error::ScannerError> {
         use crate::error::ScannerError;
+        use crate::finding::Confidence;
+
         if self.jira_url.is_empty() {
-            return Err(ScannerError::Config("JIRA_URL is required".to_string()));
+            return Err(ScannerError::Config(
+                "JIRA_URL is required; set JIRA_URL or --jira-url".to_string(),
+            ));
         }
-        if self.jql.is_none() || self.jql.as_deref() == Some("") {
-            return Err(ScannerError::Config("JIRA_JQL / --jql is required".to_string()));
+        let scheme = self.jira_url.to_ascii_lowercase();
+        if !(scheme.starts_with("http://") || scheme.starts_with("https://")) {
+            return Err(ScannerError::Config(format!(
+                "jira_url must start with http:// or https://, got '{}'",
+                self.jira_url
+            )));
+        }
+        if self.jql.as_deref().unwrap_or("").is_empty() {
+            return Err(ScannerError::Config(
+                "JIRA_JQL / --jql is required and must not be empty".to_string(),
+            ));
         }
         if self.pat.is_empty() && self.auth != "none" {
-            return Err(ScannerError::Config("JIRA_PAT / --pat is required".to_string()));
+            return Err(ScannerError::Config(
+                "JIRA_PAT / --pat is required (or JIRA_API_TOKEN); use --auth none to scan without credentials"
+                    .to_string(),
+            ));
         }
         if self.auth == "basic" && self.email.is_none() {
-            return Err(ScannerError::Config("JIRA_EMAIL is required for basic auth".to_string()));
+            return Err(ScannerError::Config(
+                "JIRA_EMAIL is required for basic auth".to_string(),
+            ));
+        }
+        if !["bearer", "basic", "none"].contains(&self.auth.as_str()) {
+            return Err(ScannerError::Config(format!(
+                "auth must be bearer, basic or none, got '{}'",
+                self.auth
+            )));
+        }
+        if self.page_size == 0 {
+            return Err(ScannerError::Config(format!(
+                "page_size must be greater than 0, got {}",
+                self.page_size
+            )));
+        }
+        if self.concurrency == 0 {
+            return Err(ScannerError::Config(format!(
+                "concurrency must be greater than 0, got {}",
+                self.concurrency
+            )));
+        }
+        if self.max_findings_per_issue == 0 {
+            return Err(ScannerError::Config(format!(
+                "max_findings_per_issue must be greater than 0, got {}",
+                self.max_findings_per_issue
+            )));
+        }
+        if self.max_text_size_kb == 0 {
+            return Err(ScannerError::Config(format!(
+                "max_text_size_kb must be greater than 0, got {}",
+                self.max_text_size_kb
+            )));
+        }
+        if self.max_attachment_size_mb == 0 {
+            return Err(ScannerError::Config(format!(
+                "max_attachment_size_mb must be greater than 0, got {}",
+                self.max_attachment_size_mb
+            )));
+        }
+        if !["flat", "nested"].contains(&self.report_layout.as_str()) {
+            return Err(ScannerError::Config(format!(
+                "report_layout must be flat or nested, got '{}'",
+                self.report_layout
+            )));
+        }
+        if Confidence::parse_opt(&self.min_confidence).is_none() {
+            return Err(ScannerError::Config(format!(
+                "min_confidence must be low, medium or high, got '{}'",
+                self.min_confidence
+            )));
+        }
+        if let Err(message) = parse_formats(&self.format) {
+            return Err(ScannerError::Config(format!(
+                "format: {message} (got '{}')",
+                self.format
+            )));
         }
         Ok(())
     }
 }
 
 impl fmt::Debug for Config {
+    /// Hand-written so that the token never reaches a log line: `pat` is always
+    /// rendered as `***`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Config")
             .field("jira_url", &self.jira_url)
@@ -294,5 +549,85 @@ impl fmt::Debug for Config {
             .field("db_url", &self.db_url)
             .field("report_layout", &self.report_layout)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The masking `Debug` impl is the reason it is hand-written — pin it.
+    #[test]
+    fn debug_masks_the_token() {
+        let config = Config::test_config("https://jira.example.com", "super-secret-token");
+        let rendered = format!("{config:?}");
+        assert!(!rendered.contains("super-secret-token"));
+        assert!(rendered.contains("pat: \"***\""));
+    }
+
+    #[test]
+    fn metrics_format_accepts_documented_spellings() {
+        assert_eq!(MetricsFormat::parse_opt("json"), Some(MetricsFormat::Json));
+        assert_eq!(MetricsFormat::parse_opt("JSON"), Some(MetricsFormat::Json));
+        assert_eq!(
+            MetricsFormat::parse_opt("prom"),
+            Some(MetricsFormat::Prometheus)
+        );
+        assert_eq!(
+            MetricsFormat::parse_opt("Prometheus"),
+            Some(MetricsFormat::Prometheus)
+        );
+        assert_eq!(MetricsFormat::parse_opt("text"), None);
+        assert_eq!(MetricsFormat::default(), MetricsFormat::Json);
+    }
+
+    /// `--format` accepts exactly the names the report catalogue can write, plus
+    /// `all`. The list used to be a second literal here; this pins the coupling
+    /// from the configuration side, so a format added to `report` is accepted
+    /// (and one removed is rejected) without a second edit.
+    #[test]
+    fn report_formats_come_from_the_catalogue() {
+        for name in crate::report::FORMAT_NAMES {
+            assert!(accepted_format(name), "{name} must be accepted");
+            assert!(parse_formats(name).is_ok());
+        }
+        assert!(accepted_format("all"));
+        assert!(parse_formats("json, all").is_ok());
+        assert!(parse_formats("json,ndjson,csv,sarif,summary,defectdojo,all").is_ok());
+
+        assert!(!accepted_format("xml"));
+        assert!(parse_formats("").is_err());
+        assert!(parse_formats("json,,csv").is_err());
+        assert!(parse_formats(" json , xml ").is_err());
+
+        let err = parse_formats("xml").expect_err("xml is not a report format");
+        assert!(err.contains("unknown report format 'xml'"), "{err}");
+        for name in crate::report::FORMAT_NAMES {
+            assert!(err.contains(name), "the message must list {name}: {err}");
+        }
+    }
+
+    #[test]
+    fn resolve_pat_prefers_the_highest_priority_source() {
+        let all = resolve_pat(
+            Some("cli".into()),
+            Some("env-pat".into()),
+            Some("env-alias".into()),
+        );
+        assert_eq!(all.as_deref(), Some("cli"));
+        assert_eq!(
+            resolve_pat(None, Some("env-pat".into()), Some("env-alias".into())).as_deref(),
+            Some("env-pat")
+        );
+        assert_eq!(
+            resolve_pat(None, None, Some("env-alias".into())).as_deref(),
+            Some("env-alias")
+        );
+        assert_eq!(resolve_pat(None, None, None), None);
+        // Empty and blank values count as not set.
+        assert_eq!(
+            resolve_pat(Some(String::new()), Some("  ".into()), Some("env".into())).as_deref(),
+            Some("env")
+        );
     }
 }

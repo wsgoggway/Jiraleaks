@@ -1,15 +1,22 @@
+# Build output
 /target/
-/.jiraleaks-state/
-/reports/
 **/*.rs.bk
-# secrets / credentials — never commit
+
+# Local scan artifacts: reports and the findings store hold real secrets found
+# in Jira (plus the sqlite state DB). Directory names are anchored to the repo
+# root so a future `src/reports/` module would still be tracked.
+/reports/
+/.jss-state/
+/.jiraleaks-state/
+*.db
+*.sqlite
+*.sqlite3
+
+# Secrets / credentials — never commit
 .env*
 *.key
 *.pem
 *.pfx
 *.p12
-*.sqlite
-*.sqlite3
-*.db
 credentials*
 secrets*

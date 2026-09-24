@@ -1,54 +1,75 @@
-use crate::error::ScannerError;
-use crate::finding::{Finding, ScanRun};
+//! Microsoft Teams channel: posts a legacy `MessageCard` to an Office 365
+//! incoming webhook.
+//!
+//! Teams renders the card's `text` as Markdown, so the body is built by
+//! [`message`] — pure, and tested directly (see `tests/alert_payloads.rs`).
 
-/// Send findings summary to Microsoft Teams webhook.
-pub fn send(
-    webhook_url: &str,
-    scan_run: &ScanRun,
-    findings: &[&Finding],
-) -> Result<(), ScannerError> {
-    let text = build_teams_message(scan_run, findings);
+use crate::finding::{Confidence, Finding, ScanRun};
 
-    let client = reqwest::blocking::Client::new();
-    let payload = serde_json::json!({
-        "@type": "MessageCard",
-        "@context": "https://schema.org/extensions",
-        "summary": format!("Jira Secret Scanner: {} findings", scan_run.findings_total),
-        "title": "Jira Secret Scanner — Scan Complete",
-        "text": text,
-    });
+use super::{filter_by_confidence, AlertChannel};
 
-    match client
-        .post(webhook_url)
-        .json(&payload)
-        .timeout(std::time::Duration::from_secs(10))
-        .send()
-    {
-        Ok(resp) => {
-            if resp.status().is_success() {
-                tracing::info!("Teams alert sent successfully");
-            } else {
-                tracing::warn!(
-                    status = resp.status().as_u16(),
-                    "Teams webhook returned non-success status"
-                );
-            }
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "Failed to send Teams alert");
-        }
-    }
+/// Findings listed on the card; a Teams card has a hard size limit and the alert
+/// is a summary that links back to the report.
+const TOP_FINDINGS: usize = 10;
 
-    Ok(())
+/// A Microsoft Teams incoming-webhook destination.
+///
+/// The URL is a bearer secret; `Debug` masks it so an accidental `info!(?chan)`
+/// cannot leak it into a log.
+pub struct TeamsChannel {
+    webhook_url: String,
+    min_confidence: Confidence,
 }
 
-fn build_teams_message(scan_run: &ScanRun, findings: &[&Finding]) -> String {
+impl TeamsChannel {
+    /// Build a channel that posts findings at or above `min_confidence`.
+    pub fn new(webhook_url: impl Into<String>, min_confidence: Confidence) -> Self {
+        Self {
+            webhook_url: webhook_url.into(),
+            min_confidence,
+        }
+    }
+}
+
+impl std::fmt::Debug for TeamsChannel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TeamsChannel")
+            .field("webhook_url", &"***")
+            .field("min_confidence", &self.min_confidence)
+            .finish()
+    }
+}
+
+impl AlertChannel for TeamsChannel {
+    fn name(&self) -> &'static str {
+        "teams"
+    }
+
+    fn endpoint(&self) -> &str {
+        &self.webhook_url
+    }
+
+    fn payload(&self, scan_run: &ScanRun, findings: &[Finding]) -> serde_json::Value {
+        let visible = filter_by_confidence(findings, self.min_confidence);
+        serde_json::json!({
+            "@type": "MessageCard",
+            "@context": "https://schema.org/extensions",
+            "summary": format!("Jira Secret Scanner: {} findings", scan_run.findings_total),
+            "title": "Jira Secret Scanner — Scan Complete",
+            "text": message(scan_run, &visible),
+        })
+    }
+}
+
+/// The Markdown body of the card: scan counters plus linked top findings.
+///
+/// As in the Slack builder, only redacted, already-public fields reach the text.
+fn message(scan_run: &ScanRun, findings: &[&Finding]) -> String {
     let mut msg = String::new();
+    msg.push_str(&format!("**Status:** {:?}  \n", scan_run.status));
     msg.push_str(&format!(
-        "**Status:** {:?}  \n", scan_run.status
-    ));
-    msg.push_str(&format!(
-        "**Issues scanned:** {}  \n", scan_run.issues_scanned
+        "**Issues scanned:** {}  \n",
+        scan_run.issues_scanned
     ));
     msg.push_str(&format!(
         "**Findings:** {} total (Critical: {}, High: {}, Medium: {}, Low: {})  \n",
@@ -58,14 +79,11 @@ fn build_teams_message(scan_run: &ScanRun, findings: &[&Finding]) -> String {
         scan_run.findings_medium,
         scan_run.findings_low,
     ));
-    msg.push_str(&format!(
-        "**Duration:** {:.1}s  \n",
-        scan_run.duration_secs
-    ));
+    msg.push_str(&format!("**Duration:** {:.1}s  \n", scan_run.duration_secs));
 
     if !findings.is_empty() {
         msg.push_str("\n**Top findings:**  \n");
-        for f in findings.iter().take(10) {
+        for f in findings.iter().take(TOP_FINDINGS) {
             msg.push_str(&format!(
                 "- {:?} `{}` — [{}]({})  \n",
                 f.severity, f.rule_id, f.issue_key, f.issue_url,

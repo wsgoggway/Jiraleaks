@@ -1,45 +1,67 @@
-use crate::error::ScannerError;
-use crate::finding::{Finding, ScanRun};
+//! Slack channel: posts one mrkdwn `text` blob to a Slack incoming webhook.
+//!
+//! The payload is a single `text` field because that is what an incoming webhook
+//! renders without an app manifest; the message body is built by [`message`],
+//! which is pure and therefore tested directly (see `tests/alert_payloads.rs`).
 
-/// Send findings summary to a Slack webhook.
-pub fn send(
-    webhook_url: &str,
-    scan_run: &ScanRun,
-    findings: &[&Finding],
-) -> Result<(), ScannerError> {
-    let text = build_slack_message(scan_run, findings);
+use crate::finding::{Confidence, Finding, ScanRun};
 
-    // Fire-and-forget: log errors but don't fail the scan
-    let client = reqwest::blocking::Client::new();
-    let payload = serde_json::json!({
-        "text": text,
-    });
+use super::{filter_by_confidence, AlertChannel};
 
-    match client
-        .post(webhook_url)
-        .json(&payload)
-        .timeout(std::time::Duration::from_secs(10))
-        .send()
-    {
-        Ok(resp) => {
-            if resp.status().is_success() {
-                tracing::info!("Slack alert sent successfully");
-            } else {
-                tracing::warn!(
-                    status = resp.status().as_u16(),
-                    "Slack webhook returned non-success status"
-                );
-            }
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "Failed to send Slack alert");
-        }
-    }
+/// Findings listed in the message body. Slack truncates oversized messages, and
+/// an alert is a summary that links back to the report — not a report.
+const TOP_FINDINGS: usize = 10;
 
-    Ok(())
+/// A Slack incoming-webhook destination.
+///
+/// The URL is a bearer secret; `Debug` masks it so an accidental `info!(?chan)`
+/// cannot leak it into a log.
+pub struct SlackChannel {
+    webhook_url: String,
+    min_confidence: Confidence,
 }
 
-fn build_slack_message(scan_run: &ScanRun, findings: &[&Finding]) -> String {
+impl SlackChannel {
+    /// Build a channel that posts findings at or above `min_confidence`.
+    pub fn new(webhook_url: impl Into<String>, min_confidence: Confidence) -> Self {
+        Self {
+            webhook_url: webhook_url.into(),
+            min_confidence,
+        }
+    }
+}
+
+impl std::fmt::Debug for SlackChannel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SlackChannel")
+            .field("webhook_url", &"***")
+            .field("min_confidence", &self.min_confidence)
+            .finish()
+    }
+}
+
+impl AlertChannel for SlackChannel {
+    fn name(&self) -> &'static str {
+        "slack"
+    }
+
+    fn endpoint(&self) -> &str {
+        &self.webhook_url
+    }
+
+    fn payload(&self, scan_run: &ScanRun, findings: &[Finding]) -> serde_json::Value {
+        let visible = filter_by_confidence(findings, self.min_confidence);
+        serde_json::json!({ "text": message(scan_run, &visible) })
+    }
+}
+
+/// The mrkdwn body: scan counters plus the top findings as linked lines.
+///
+/// Only redacted, already-public fields are interpolated — severity, rule id,
+/// issue key and the Jira URL. The secret never enters the message, not even in
+/// its redacted form, because the alert is the one sink with no retention
+/// policy the scanner controls.
+fn message(scan_run: &ScanRun, findings: &[&Finding]) -> String {
     let mut msg = String::new();
     msg.push_str("*Jira Secret Scanner — Scan Complete*\n");
     msg.push_str(&format!(
@@ -57,7 +79,7 @@ fn build_slack_message(scan_run: &ScanRun, findings: &[&Finding]) -> String {
 
     if !findings.is_empty() {
         msg.push_str("\n*Top findings:*\n");
-        for (i, f) in findings.iter().take(10).enumerate() {
+        for (i, f) in findings.iter().take(TOP_FINDINGS).enumerate() {
             msg.push_str(&format!(
                 "{}: {:?} `{}` — <{}|{}> \n",
                 i + 1,
@@ -67,8 +89,8 @@ fn build_slack_message(scan_run: &ScanRun, findings: &[&Finding]) -> String {
                 f.issue_key,
             ));
         }
-        if findings.len() > 10 {
-            msg.push_str(&format!("... and {} more\n", findings.len() - 10));
+        if findings.len() > TOP_FINDINGS {
+            msg.push_str(&format!("... and {} more\n", findings.len() - TOP_FINDINGS));
         }
     }
 

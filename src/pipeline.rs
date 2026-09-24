@@ -1,7 +1,7 @@
+use std::collections::HashSet;
 use std::io::IsTerminal;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::collections::HashSet;
 use std::time::Duration;
 
 use indicatif::{ProgressBar, ProgressStyle};
@@ -10,13 +10,15 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::allowlist::AllowlistFilter;
+use crate::attachments::{self, AttachmentPolicy};
+use crate::candidate::{Candidate, Judge, Verdict};
 use crate::config::Config;
 use crate::credpair::CredentialPairDetector;
 use crate::dedup::Deduplicator;
 use crate::error::ScannerError;
-use crate::extract::TextExtractor;
-use crate::fetcher::Fetcher;
-use crate::finding::{self, Confidence, Finding, FindingStatus, Location, ScanRun, ScanStatus, Severity};
+use crate::extract::{SourceType, TextExtractor, TextSegment};
+use crate::fetcher::{FetchOptions, Fetcher};
+use crate::finding::{Confidence, Finding, FindingStatus, Location, ScanRun, ScanStatus, Severity};
 use crate::hash::secret_hash;
 use crate::jira::client::JiraClient;
 use crate::jira::models::Issue;
@@ -25,10 +27,31 @@ use crate::redact;
 use crate::report;
 use crate::rules::RulesEngine;
 
+/// What one issue contributed to the scan.
+///
+/// The counters travel with the findings instead of being pushed into
+/// [`ScanProgress`] from inside the task, so they are recorded at exactly the
+/// point the issue's findings are (see [`collect_one`]): an issue either
+/// contributes everything it found or is counted as failed, never half of each.
+struct IssueOutcome {
+    findings: Vec<Finding>,
+    /// Comment bodies scanned for this issue — see
+    /// [`ScanProgress::comments_scanned`] for what the number counts.
+    comments_scanned: u64,
+    attachments_scanned: u64,
+}
+
 /// Run the full scanning pipeline (spec §11.2).
-pub async fn run(config: Config, client: JiraClient) -> Result<std::process::ExitCode, ScannerError> {
+pub async fn run(
+    config: Config,
+    client: JiraClient,
+) -> Result<std::process::ExitCode, ScannerError> {
     let started_at = time::OffsetDateTime::now_utc();
     let scan_id = uuid::Uuid::new_v4().to_string();
+
+    // Shared, not cloned per issue: every spawned task needs to read the
+    // configuration, and a deep `Config` clone per issue was pure allocation.
+    let config = Arc::new(config);
 
     // Load rules
     let rules_engine = RulesEngine::new(config.rules.as_deref())?;
@@ -41,9 +64,15 @@ pub async fn run(config: Config, client: JiraClient) -> Result<std::process::Exi
 
     // Build pipeline components
     let client = Arc::new(client);
-    let fetcher = Arc::new(Fetcher::new(client.clone(), config.clone()));
+    // The fetcher gets the four values it reads, not a whole configuration.
+    let fetcher = Arc::new(Fetcher::new(
+        client.clone(),
+        FetchOptions::from_config(&config),
+    ));
     let extractor = TextExtractor::new(config.max_text_size_kb);
-    let credpair_detector = CredentialPairDetector;
+    // Startup check: the credential-pair patterns are compiled once here rather
+    // than silently skipped at detection time.
+    let credpair_detector = CredentialPairDetector::new()?;
     let dedup = Deduplicator::new();
 
     let cancel = CancellationToken::new();
@@ -60,18 +89,27 @@ pub async fn run(config: Config, client: JiraClient) -> Result<std::process::Exi
     {
         let cancel_clone = cancel.clone();
         tokio::spawn(async move {
-            let mut sigterm = tokio::signal::unix::signal(
-                tokio::signal::unix::SignalKind::terminate(),
-            )
-            .expect("Failed to register SIGTERM handler");
+            let mut sigterm =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("Failed to register SIGTERM handler");
             sigterm.recv().await;
             info!("Received SIGTERM, initiating graceful shutdown...");
             cancel_clone.cancel();
         });
     }
 
-    // Fetch issues (streaming) and process them concurrently as pages arrive
-    let jql = config.jql().unwrap_or("");
+    // Fetch issues (streaming) and process them concurrently as pages arrive.
+    //
+    // `--incremental` narrows the query to the issues that changed since the
+    // previous *successful* scan. The decision — and every reason it may decline
+    // to narrow, from a missing checkpoint to a different JQL — lives in
+    // `checkpoint::plan_incremental_scan`, which logs the window it chose.
+    let configured_jql = config.jql().unwrap_or("");
+    let incremental_plan = crate::checkpoint::plan_incremental_scan(&config, configured_jql);
+    let jql = incremental_plan
+        .as_ref()
+        .map(|plan| plan.jql.as_str())
+        .unwrap_or(configured_jql);
     let bar = if std::io::stderr().is_terminal() {
         ProgressBar::new(0)
     } else {
@@ -83,12 +121,10 @@ pub async fn run(config: Config, client: JiraClient) -> Result<std::process::Exi
         )
         .expect("valid indicatif template"),
     );
-    let mut progress = ScanProgress::new();
-    progress.set_bar(bar);
-    let progress = Arc::new(progress);
-
-    let (mut issue_rx, fetch_handle) =
-        fetcher.fetch_issues_stream(jql, cancel.clone(), progress.clone()).await;
+    let progress = Arc::new(ScanProgress::with_bar(bar));
+    let (mut issue_rx, fetch_handle) = fetcher
+        .fetch_issues_stream(jql, cancel.clone(), progress.clone())
+        .await;
 
     // Periodic ticker keeps the bar's spinner/ETA fresh during quiet periods
     let progress_tick = tokio::spawn({
@@ -110,7 +146,7 @@ pub async fn run(config: Config, client: JiraClient) -> Result<std::process::Exi
     let mut errors_total = 0u64;
     let mut dedup = dedup;
     let mut all_findings: Vec<Finding> = Vec::new();
-    let mut join_set: JoinSet<Result<Vec<Finding>, ScannerError>> = JoinSet::new();
+    let mut join_set: JoinSet<Result<IssueOutcome, ScannerError>> = JoinSet::new();
     let mut scanned_issue_keys: HashSet<String> = HashSet::new();
 
     while let Some(issue) = issue_rx.recv().await {
@@ -120,14 +156,20 @@ pub async fn run(config: Config, client: JiraClient) -> Result<std::process::Exi
         }
         // backpressure: keep at most concurrency*2 tasks in flight
         while join_set.len() >= config.concurrency * 2 {
-            collect_one(&mut join_set, &mut all_findings, &mut errors_total, &progress).await;
+            collect_one(
+                &mut join_set,
+                &mut all_findings,
+                &mut errors_total,
+                &progress,
+            )
+            .await;
         }
         scanned_issue_keys.insert(issue.key.clone());
         let client = client.clone();
         let extractor = extractor.clone();
         let rules_engine = rules_engine.clone();
         let allowlist = allowlist.clone();
-        let config = config.clone();
+        let config = Arc::clone(&config);
         join_set.spawn(async move {
             process_issue(
                 &client,
@@ -143,7 +185,14 @@ pub async fn run(config: Config, client: JiraClient) -> Result<std::process::Exi
     }
 
     // Drain all remaining tasks
-    while collect_one(&mut join_set, &mut all_findings, &mut errors_total, &progress).await {}
+    while collect_one(
+        &mut join_set,
+        &mut all_findings,
+        &mut errors_total,
+        &progress,
+    )
+    .await
+    {}
 
     progress_tick.abort();
 
@@ -161,20 +210,56 @@ pub async fn run(config: Config, client: JiraClient) -> Result<std::process::Exi
 
     // Reconcile against the persistent findings store (status history +
     // live-validation) when a database URL is configured.
+    //
+    // A store that cannot be opened, migrated or reconciled is *remembered*, not
+    // propagated here, and the run continues on the findings it already has. The
+    // store is a side channel — it enriches each finding with its history
+    // (`status`, `times_seen`, `first_seen`, live validation) and keeps the audit
+    // row of the run — while the findings themselves are collected without it. So
+    // a failure here costs the enrichment, and losing the enrichment of a scan
+    // that already found secrets is strictly better than losing the whole report:
+    // the reports, metrics, alerts and checkpoint are written regardless, and the
+    // remembered error is returned at the very end, so the exit code still says
+    // "store" (5) and the failure is never swallowed.
+    //
+    // The findings that reach the emission below therefore carry `status: New`
+    // and no history when the store was unavailable — an understatement of what
+    // the database knows, never a false claim: a finding is reported, and whether
+    // it is new is what the missing database cannot answer.
     let started_at_rfc3339 = started_at
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_default();
-    let store = if let Some(db_url) = config.db_url() {
-        let store = crate::store::FindingsStore::open(&db_url).await?;
-        store.migrate().await?;
-        Some(store)
-    } else {
-        None
+    let mut store_error: Option<ScannerError> = None;
+    let store = match open_store(&config).await {
+        Ok(store) => store,
+        Err(e) => {
+            warn!(
+                error = %e,
+                "Findings store unavailable: continuing without status history and live validation"
+            );
+            store_error = Some(e);
+            None
+        }
     };
     if let Some(ref store) = store {
-        findings = store
-            .reconcile(&findings, &scanned_issue_keys, &scan_id, &started_at_rfc3339)
-            .await?;
+        match store
+            .reconcile(
+                &findings,
+                &scanned_issue_keys,
+                &scan_id,
+                &started_at_rfc3339,
+            )
+            .await
+        {
+            Ok(reconciled) => findings = reconciled,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "Findings store reconcile failed: reporting the findings without their history"
+                );
+                store_error = Some(e);
+            }
+        }
     }
 
     // Count findings by severity
@@ -211,7 +296,15 @@ pub async fn run(config: Config, client: JiraClient) -> Result<std::process::Exi
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap_or_default(),
         jira_url: config.jira_url.clone(),
+        // The query that actually ran, narrowed when `--incremental` applied it:
+        // the report has to describe the scan that produced the findings, and the
+        // baseline for the *next* run is stored separately (`checkpoint` keeps
+        // the configured query, not this one).
         jql: jql.to_string(),
+        // `issues_done` counts finished attempts: an issue whose processing
+        // failed is counted here too (and again in `errors_total`), so
+        // `issues_scanned` is "issues attempted", not "issues scanned
+        // successfully". See `progress.rs` for the counter semantics.
         issues_scanned: progress.issues_done.load(Ordering::Relaxed),
         issues_total: progress.issues_total.load(Ordering::Relaxed),
         findings_total: findings.len() as u64,
@@ -221,8 +314,11 @@ pub async fn run(config: Config, client: JiraClient) -> Result<std::process::Exi
         findings_low,
         findings_info,
         errors_total,
-        comments_scanned: 0,
-        attachments_scanned: 0,
+        // Counted while the issues were processed: comment bodies scanned and
+        // attachments whose text was fetched. See `progress.rs` for exactly
+        // what each one counts.
+        comments_scanned: progress.comments_scanned.load(Ordering::Relaxed),
+        attachments_scanned: progress.attachments_scanned.load(Ordering::Relaxed),
         scanner_version: env!("CARGO_PKG_VERSION").to_string(),
         duration_secs: duration,
     };
@@ -234,11 +330,7 @@ pub async fn run(config: Config, client: JiraClient) -> Result<std::process::Exi
 
     // Write metrics if configured
     if let Some(ref metrics_path) = config.metrics_path {
-        crate::metrics::write_metrics(
-            metrics_path,
-            &config.metrics_format,
-            &scan_run,
-        )?;
+        crate::metrics::write_metrics(metrics_path, config.metrics_format, &scan_run)?;
     }
 
     // Send alerts if configured
@@ -246,10 +338,9 @@ pub async fn run(config: Config, client: JiraClient) -> Result<std::process::Exi
         crate::alert::send_alerts(alerts_path, &scan_run, &findings)?;
     }
 
-    // Write checkpoint on success
-    if config.incremental && matches!(scan_run.status, ScanStatus::Success) {
-        crate::checkpoint::write_checkpoint(&config, &scan_run)?;
-    }
+    // Advance the incremental baseline. Only a fully successful scan may do so:
+    // the gate (and the reason it declines) lives in `checkpoint`.
+    crate::checkpoint::maybe_write_checkpoint(&config, &scan_run)?;
 
     info!(
         findings_total = scan_run.findings_total,
@@ -259,18 +350,48 @@ pub async fn run(config: Config, client: JiraClient) -> Result<std::process::Exi
         "Scan complete"
     );
 
-    // Record the scan into the findings store audit table.
+    // Record the scan into the findings store audit table. The reports are on
+    // disk by now, so a failure here is remembered like the ones above instead of
+    // taking the run down mid-way.
     if let Some(ref store) = store {
-        store.record_scan(&scan_run).await?;
+        if let Err(e) = store.record_scan(&scan_run).await {
+            warn!(error = %e, "Failed to record the scan in the findings store");
+            if store_error.is_none() {
+                store_error = Some(e);
+            }
+        }
+    }
+
+    // Everything the scan produced has been written. Only now does a store
+    // failure become the exit code (5): the operator still sees that the database
+    // was unavailable, and the reports of the run are not the price of it.
+    if let Some(e) = store_error {
+        return Err(e);
     }
 
     Ok(std::process::ExitCode::from(0))
 }
 
+/// Open and migrate the findings store, if one is configured.
+///
+/// `Ok(None)` means "the store is disabled" (no `--db-url` and no state
+/// directory) and is not a failure; any `Err` is a store that was asked for and
+/// could not be prepared. The caller decides what a failure costs — see the
+/// comment at the call site: the pipeline keeps going without the store and
+/// returns the error at the end.
+async fn open_store(config: &Config) -> Result<Option<crate::store::FindingsStore>, ScannerError> {
+    let Some(db_url) = config.db_url() else {
+        return Ok(None);
+    };
+    let store = crate::store::FindingsStore::open(&db_url).await?;
+    store.migrate().await?;
+    Ok(Some(store))
+}
+
 /// Collect one finished task from the JoinSet. Returns true if a task was
 /// collected, false if the set is empty.
 async fn collect_one(
-    join_set: &mut JoinSet<Result<Vec<Finding>, ScannerError>>,
+    join_set: &mut JoinSet<Result<IssueOutcome, ScannerError>>,
     all_findings: &mut Vec<Finding>,
     errors_total: &mut u64,
     progress: &ScanProgress,
@@ -279,9 +400,11 @@ async fn collect_one(
         return false;
     };
     match res {
-        Ok(Ok(fs)) => {
-            let found = fs.len() as u64;
-            all_findings.extend(fs);
+        Ok(Ok(outcome)) => {
+            let found = outcome.findings.len() as u64;
+            progress.record_comments(outcome.comments_scanned);
+            progress.record_attachments(outcome.attachments_scanned);
+            all_findings.extend(outcome.findings);
             progress.finish_issue(found);
         }
         Ok(Err(e)) => {
@@ -300,6 +423,12 @@ async fn collect_one(
 
 /// Process a single issue: extract text, scan with rules, detect credpairs,
 /// apply allowlist, adjust confidence, and return findings.
+///
+/// Every text the issue carries reaches the scanning loop below as a
+/// [`crate::extract::TextSegment`], whatever its source: the payload's fields,
+/// the comment pages after the first, and the attachment bodies. There is one
+/// scanning loop, one rules engine and one credential-pair detector, so a secret
+/// in an attachment is found by exactly the code that finds one in a description.
 async fn process_issue(
     client: &JiraClient,
     extractor: &TextExtractor,
@@ -308,39 +437,76 @@ async fn process_issue(
     allowlist: &AllowlistFilter,
     config: &Config,
     issue: Issue,
-) -> Result<Vec<Finding>, ScannerError> {
+) -> Result<IssueOutcome, ScannerError> {
     let issue_key = issue.key.clone();
     let issue_url = format!("{}/browse/{issue_key}", config.jira_url);
 
-    // Extract text segments
-    let segments = extractor.extract(&issue_key, &issue.fields);
+    // Extract text segments from the payload. This includes the *first page* of
+    // the issue's comments: Jira embeds `comment.maxResults` of them in the
+    // issue itself.
+    let mut segments = extractor.extract(&issue_key, &issue.fields);
 
-    // Fetch additional comments if needed (paginated)
-    let mut extra_comments = Vec::new();
+    // Comments after the first page are not in the payload, and are lost unless
+    // they are fetched — `comments_mode = all`, the default, promises them.
     if config.comments_mode != "none" {
-        if let Some(comment_field) = issue.fields.get("comment") {
-            let total = comment_field
-                .get("total")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            let existing_count = comment_field
-                .get("comments")
-                .and_then(|v| v.as_array())
-                .map(|a| a.len() as u64)
-                .unwrap_or(0);
-            if total > existing_count {
-                match client.get_comments_paginated(&issue_key, existing_count, 50).await {
-                    Ok(mut page) => extra_comments.append(&mut page.comments),
-                    Err(e) => {
-                        warn!(issue = %issue_key, error = %e, "Failed to fetch extra comments");
+        let (total, offset) = comment_paging(&issue.fields);
+        if total > offset {
+            match client.get_comments_after(&issue_key, offset).await {
+                Ok(fetched) => {
+                    let fetched_count = fetched.len();
+                    for (i, comment) in fetched.into_iter().enumerate() {
+                        // Numbered by their position in the whole thread, not
+                        // by their position in the page, so a comment's path is
+                        // the same shape as the first page's
+                        // (`comment.comments[<n>].body`) and does not collide
+                        // with it.
+                        let path = format!(
+                            "comment.comments[{}].body",
+                            (offset as usize).saturating_add(i)
+                        );
+                        segments.extend(extractor.extract_at(&path, &comment.body));
                     }
+                    debug!(
+                        issue = %issue_key,
+                        fetched = fetched_count,
+                        total,
+                        "Fetched the comment pages after the first"
+                    );
+                }
+                Err(e) => {
+                    // Non-fatal by design: the issue's other findings are still
+                    // reported, and the missing pages are logged.
+                    warn!(issue = %issue_key, error = %e, "Failed to fetch extra comments");
                 }
             }
         }
     }
 
+    // Attachments are off unless `--scan-attachments` is set, and nothing here
+    // issues a request when it is not.
+    let attachment_policy = AttachmentPolicy::from_config(config);
+    let attachment_outcome = if attachment_policy.enabled {
+        let (attachment_segments, outcome) = attachments::collect_segments(
+            client,
+            extractor,
+            &issue_key,
+            &issue.fields,
+            &attachment_policy,
+        )
+        .await;
+        segments.extend(attachment_segments);
+        outcome
+    } else {
+        attachments::AttachmentOutcome::default()
+    };
+
+    let comments_scanned = comment_bodies_scanned(&segments);
+
     let mut findings: Vec<Finding> = Vec::new();
     let mut issue_findings_count = 0usize;
+
+    // The judge holds no state, so one value serves every hit of the issue.
+    let judge = Judge::new();
 
     for segment in &segments {
         if issue_findings_count >= config.max_findings_per_issue {
@@ -354,75 +520,53 @@ async fn process_issue(
 
         // 1. Regex rule scanning
         let hits = rules_engine.scan(&segment.text, &segment.field_path);
-        for hit in hits {
+        for hit in hits.iter() {
             if issue_findings_count >= config.max_findings_per_issue {
                 break;
             }
 
             let secret_hash = secret_hash(&hit.matched_value);
 
-            // Allowlist check
-            if allowlist.is_allowed(
-                &hit.matched_value,
+            // Allowlist, the placeholder check, the context boost, the confidence
+            // adjustment and the min-confidence floor are one call into
+            // `candidate::Judge`: that chain used to be inline here, and a
+            // rejected candidate was dropped without a trace. The judge logs the
+            // reason of every drop it decides.
+            let candidate = Candidate {
+                value: &hit.matched_value,
+                text: &segment.text,
+                value_span: hit.match_span.clone(),
+                field_path: &hit.field_path,
+                issue_key: &issue_key,
+            };
+
+            // `check` reports *which* entry suppressed the value, so the entry's
+            // audit `reason` travels into the verdict (`DropReason::Allowlisted`)
+            // and into the debug log of the drop instead of being lost.
+            let allowlisted = allowlist
+                .check(
+                    &hit.matched_value,
+                    &hit.rule_id,
+                    &issue_key,
+                    &hit.field_path,
+                )
+                .map(|matched| matched.reason.map(str::to_string));
+
+            let confidence = match judge.finalize(
                 &hit.rule_id,
-                &issue_key,
-                &hit.field_path,
+                Confidence::parse(&hit.confidence),
+                &candidate,
+                allowlisted,
+                Confidence::parse(&config.min_confidence),
             ) {
-                debug!(
-                    rule_id = %hit.rule_id,
-                    issue = %issue_key,
-                    "Finding excluded by allowlist"
-                );
-                continue;
-            }
+                Verdict::Keep { confidence, .. } => confidence,
+                Verdict::Drop(_) => continue,
+            };
 
-            // Placeholder check
-            let is_placeholder = crate::credpair::is_placeholder_static(&hit.matched_value);
-
-            // Context keyword check: look for secret-related words around the match
-            const CONTEXT_WORDS: &[&str] = &[
-                "secret", "key", "token", "password", "passwd", "pwd",
-                "credential", "api_key", "apikey", "access_key", "private_key",
-            ];
-            let win_start = segment.text.floor_char_boundary(hit.start.saturating_sub(50));
-            let win_end = segment
-                .text
-                .ceil_char_boundary((hit.end + 50).min(segment.text.len()));
-            let window = &segment.text[win_start..win_end].to_lowercase();
-            let has_context = CONTEXT_WORDS.iter().any(|w| window.contains(w));
-
-            // Confidence adjustment
-            let confidence = finding::adjust_confidence(
-                parse_confidence(&hit.confidence),
-                has_context,
-                crate::entropy::shannon(&hit.matched_value) > 3.5,
-                is_placeholder,
-            );
-
-            // Filter by min-confidence
-            if confidence < parse_confidence(&config.min_confidence) {
-                continue;
-            }
-
+            // A snippet is a ±50 byte window, so it can carry the secrets of the
+            // neighbouring findings of the same segment: the hit masks those too.
             let redacted = redact::redact(&hit.matched_value);
-            let redacted_snippet = redact::redact_snippet(
-                &hit.snippet,
-                hit.start.saturating_sub(
-                    hit.snippet.len().saturating_sub(
-                        hit.snippet
-                            .find(&hit.matched_value)
-                            .unwrap_or(0),
-                    ),
-                ),
-                hit.start.saturating_sub(
-                    hit.snippet.len().saturating_sub(
-                        hit.snippet
-                            .find(&hit.matched_value)
-                            .unwrap_or(0),
-                    ),
-                ) + hit.matched_value.len(),
-                &hit.rule_id,
-            );
+            let redacted_snippet = hit.redacted_snippet(&hits);
 
             findings.push(Finding {
                 finding_id: uuid::Uuid::new_v4().to_string(),
@@ -430,7 +574,7 @@ async fn process_issue(
                 issue_url: issue_url.clone(),
                 field_path: hit.field_path.clone(),
                 rule_id: hit.rule_id.clone(),
-                severity: parse_severity(&hit.severity),
+                severity: Severity::parse(&hit.severity),
                 confidence,
                 redacted_secret: redacted,
                 secret_hash,
@@ -463,8 +607,8 @@ async fn process_issue(
                 break;
             }
 
-            let confidence = parse_confidence("high");
-            if confidence < parse_confidence(&config.min_confidence) {
+            let confidence = Confidence::parse("high");
+            if confidence < Confidence::parse(&config.min_confidence) {
                 continue;
             }
 
@@ -504,27 +648,70 @@ async fn process_issue(
         }
     }
 
-    debug!(issue = %issue_key, findings = findings.len(), "Issue processed");
+    debug!(
+        issue = %issue_key,
+        findings = findings.len(),
+        comments_scanned,
+        attachments_scanned = attachment_outcome.scanned,
+        "Issue processed"
+    );
 
-    Ok(findings)
+    Ok(IssueOutcome {
+        findings,
+        comments_scanned,
+        attachments_scanned: attachment_outcome.scanned,
+    })
 }
 
-pub fn parse_severity(s: &str) -> Severity {
-    match s.to_lowercase().as_str() {
-        "critical" => Severity::Critical,
-        "high" => Severity::High,
-        "medium" => Severity::Medium,
-        "low" => Severity::Low,
-        "info" => Severity::Info,
-        _ => Severity::Medium,
-    }
+/// Comment counts carried by an issue payload: `(total, offset)`.
+///
+/// Jira puts only the first page of an issue's comments into the issue's
+/// `comment` field — `maxResults` entries of `total`, starting at `startAt` — so
+/// `offset` is where the next page starts and what the fetch must not re-read.
+/// Both values are `0` when the payload carries no comment field at all (a
+/// `--fields` list without `comment`), and nothing is fetched then.
+fn comment_paging(fields: &serde_json::Value) -> (u64, u64) {
+    let Some(comment) = fields.get("comment") else {
+        return (0, 0);
+    };
+
+    let total = comment
+        .get("total")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let start_at = comment
+        .get("startAt")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let in_payload = comment
+        .get("comments")
+        .and_then(serde_json::Value::as_array)
+        .map(|comments| comments.len() as u64)
+        .unwrap_or(0);
+
+    (total, start_at + in_payload)
 }
 
-pub fn parse_confidence(s: &str) -> Confidence {
-    match s.to_lowercase().as_str() {
-        "high" => Confidence::High,
-        "medium" => Confidence::Medium,
-        "low" => Confidence::Low,
-        _ => Confidence::Low,
+/// How many comment bodies `segments` covers — the number
+/// [`ScanProgress::comments_scanned`] reports.
+///
+/// Counting segments would not be the same number: a comment body is walked
+/// leaf by leaf (an ADF body is one segment per text node) while the comment's
+/// other fields — its id, its author's name — are text segments too. The
+/// counter is about comments, so the bodies are grouped by their path up to
+/// `.body` and counted once each.
+fn comment_bodies_scanned(segments: &[TextSegment]) -> u64 {
+    const BODY: &str = ".body";
+
+    let mut bodies: HashSet<&str> = HashSet::new();
+    for segment in segments {
+        if segment.source_type != SourceType::Comment {
+            continue;
+        }
+        if let Some(at) = segment.field_path.find(BODY) {
+            bodies.insert(&segment.field_path[..at + BODY.len()]);
+        }
     }
+
+    bodies.len() as u64
 }

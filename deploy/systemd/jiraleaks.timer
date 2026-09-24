@@ -1,9 +1,14 @@
 [Unit]
-Description=jiraleaks — weekly scan
+Description=jiraleaks — weekly Jira secret scan
+Documentation=https://github.com/wsgoggway/Jiraleaks
 
 [Timer]
+# Explicit so the timer keeps working if the .service is renamed/instantiated.
+Unit=jiraleaks.service
 OnCalendar=Mon *-*-* 03:00:00
+# Spread the load: fire within 30 minutes after the scheduled time.
 RandomizedDelaySec=1800
+# Run a scan missed because the host was powered off.
 Persistent=true
 
 [Install]
