@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # -D warnings is the target state, but the tree currently carries two
+      # pre-existing warnings outside the infra scope:
+      #   src/credpair.rs          clippy::result_large_err
+      #   tests/snippet_redaction.rs clippy::useless_format
+      # Add `-- -D warnings` here (or run `just lint-strict`) once they are fixed.
+      - run: cargo clippy --all-targets --locked
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --all-targets --locked
+
+  docker:
+    name: docker build + smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          tags: jiraleaks:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      # No Jira credentials are needed: the image must answer --help and emit
+      # completions, which exercises the entrypoint and the runtime paths.
+      - name: smoke test
+        run: |
+          docker run --rm jiraleaks:ci --help
+          docker run --rm jiraleaks:ci completions bash
