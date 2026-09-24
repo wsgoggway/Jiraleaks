@@ -715,26 +715,3 @@ fn comment_bodies_scanned(segments: &[TextSegment]) -> u64 {
 
     bodies.len() as u64
 }
-
-/// Legacy shim — use [`Severity::parse`] or [`Severity::from_str`] from
-/// [`crate::finding`] instead.
-///
-/// Retained for one remaining caller, `tests/config_cli.rs`, which reaches for it
-/// through `jiraleaks::pipeline`. Nothing in `src/` uses it any more; the two
-/// `src/` call sites were migrated, and this pair can go as soon as that test
-/// calls `Severity::parse` itself (CHANGE REQUEST to the QA owner).
-///
-/// No `#[deprecated]` attribute on purpose: emitting a warning from another
-/// team's code during a parallel migration is noise, not a signal.
-pub fn parse_severity(s: &str) -> Severity {
-    Severity::parse(s)
-}
-
-/// Legacy shim — use [`Confidence::parse`] or [`Confidence::from_str`] from
-/// [`crate::finding`] instead.
-///
-/// Same delegation, same single remaining caller and same deliberate absence of
-/// `#[deprecated]` as [`parse_severity`].
-pub fn parse_confidence(s: &str) -> Confidence {
-    Confidence::parse(s)
-}

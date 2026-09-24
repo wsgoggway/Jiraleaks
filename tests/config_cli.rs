@@ -289,23 +289,15 @@ fn an_unknown_confidence_defaults_to_low() {
     assert_eq!(Confidence::Low.to_string(), "low");
 }
 
-/// The `pipeline::` helpers stay as delegating shims while the call sites outside
-/// this crate migrate; their behaviour must not drift.
+/// The lenient parse contract of the two domain types, exercised through
+/// `Severity::parse` / `Confidence::parse` themselves (the `pipeline::` shims
+/// that used to delegate to them are gone).
 #[test]
-fn the_legacy_pipeline_shims_delegate_to_the_domain_types() {
-    assert_eq!(jiraleaks::pipeline::parse_severity("HIGH"), Severity::High);
-    assert_eq!(
-        jiraleaks::pipeline::parse_severity("urgent"),
-        Severity::Medium
-    );
-    assert_eq!(
-        jiraleaks::pipeline::parse_confidence("HIGH"),
-        Confidence::High
-    );
-    assert_eq!(
-        jiraleaks::pipeline::parse_confidence("urgent"),
-        Confidence::Low
-    );
+fn unknown_severity_and_confidence_default_instead_of_failing() {
+    assert_eq!(Severity::parse("HIGH"), Severity::High);
+    assert_eq!(Severity::parse("urgent"), Severity::Medium);
+    assert_eq!(Confidence::parse("HIGH"), Confidence::High);
+    assert_eq!(Confidence::parse("urgent"), Confidence::Low);
 }
 
 // ---------------------------------------------------------- token resolution ---
