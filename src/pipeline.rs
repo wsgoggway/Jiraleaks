@@ -98,8 +98,18 @@ pub async fn run(
         });
     }
 
-    // Fetch issues (streaming) and process them concurrently as pages arrive
-    let jql = config.jql().unwrap_or("");
+    // Fetch issues (streaming) and process them concurrently as pages arrive.
+    //
+    // `--incremental` narrows the query to the issues that changed since the
+    // previous *successful* scan. The decision — and every reason it may decline
+    // to narrow, from a missing checkpoint to a different JQL — lives in
+    // `checkpoint::plan_incremental_scan`, which logs the window it chose.
+    let configured_jql = config.jql().unwrap_or("");
+    let incremental_plan = crate::checkpoint::plan_incremental_scan(&config, configured_jql);
+    let jql = incremental_plan
+        .as_ref()
+        .map(|plan| plan.jql.as_str())
+        .unwrap_or(configured_jql);
     let bar = if std::io::stderr().is_terminal() {
         ProgressBar::new(0)
     } else {
@@ -255,6 +265,10 @@ pub async fn run(
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap_or_default(),
         jira_url: config.jira_url.clone(),
+        // The query that actually ran, narrowed when `--incremental` applied it:
+        // the report has to describe the scan that produced the findings, and the
+        // baseline for the *next* run is stored separately (`checkpoint` keeps
+        // the configured query, not this one).
         jql: jql.to_string(),
         // `issues_done` counts finished attempts: an issue whose processing
         // failed is counted here too (and again in `errors_total`), so
@@ -293,10 +307,9 @@ pub async fn run(
         crate::alert::send_alerts(alerts_path, &scan_run, &findings)?;
     }
 
-    // Write checkpoint on success
-    if config.incremental && matches!(scan_run.status, ScanStatus::Success) {
-        crate::checkpoint::write_checkpoint(&config, &scan_run)?;
-    }
+    // Advance the incremental baseline. Only a fully successful scan may do so:
+    // the gate (and the reason it declines) lives in `checkpoint`.
+    crate::checkpoint::maybe_write_checkpoint(&config, &scan_run)?;
 
     info!(
         findings_total = scan_run.findings_total,
@@ -466,18 +479,17 @@ async fn process_issue(
                 issue_key: &issue_key,
             };
 
-            // `AllowlistFilter::is_allowed` reports only *whether* an entry
-            // matched, never which one, so the verdict cannot carry the entry's
-            // audit `reason`: the allowlist logs that itself, and this passes
-            // `None`.
+            // `check` reports *which* entry suppressed the value, so the entry's
+            // audit `reason` travels into the verdict (`DropReason::Allowlisted`)
+            // and into the debug log of the drop instead of being lost.
             let allowlisted = allowlist
-                .is_allowed(
+                .check(
                     &hit.matched_value,
                     &hit.rule_id,
                     &issue_key,
                     &hit.field_path,
                 )
-                .then_some(None);
+                .map(|matched| matched.reason.map(str::to_string));
 
             let confidence = match judge.finalize(
                 &hit.rule_id,
@@ -643,22 +655,25 @@ fn comment_bodies_scanned(segments: &[TextSegment]) -> u64 {
     bodies.len() as u64
 }
 
-/// Legacy shim — use [`Severity::parse`] or `Severity::from_str` from
+/// Legacy shim — use [`Severity::parse`] or [`Severity::from_str`] from
 /// [`crate::finding`] instead.
 ///
-/// Kept only while the call sites outside this module migrate; it delegates
-/// verbatim, so behaviour is identical. No `#[deprecated]` attribute on purpose:
-/// emitting a warning from another team's code during a parallel migration is
-/// noise, not a signal.
+/// Retained for one remaining caller, `tests/config_cli.rs`, which reaches for it
+/// through `jiraleaks::pipeline`. Nothing in `src/` uses it any more; the two
+/// `src/` call sites were migrated, and this pair can go as soon as that test
+/// calls `Severity::parse` itself (CHANGE REQUEST to the QA owner).
+///
+/// No `#[deprecated]` attribute on purpose: emitting a warning from another
+/// team's code during a parallel migration is noise, not a signal.
 pub fn parse_severity(s: &str) -> Severity {
     Severity::parse(s)
 }
 
-/// Legacy shim — use [`Confidence::parse`] or `Confidence::from_str` from
+/// Legacy shim — use [`Confidence::parse`] or [`Confidence::from_str`] from
 /// [`crate::finding`] instead.
 ///
-/// Same delegation and same deliberate absence of `#[deprecated]` as
-/// [`parse_severity`].
+/// Same delegation, same single remaining caller and same deliberate absence of
+/// `#[deprecated]` as [`parse_severity`].
 pub fn parse_confidence(s: &str) -> Confidence {
     Confidence::parse(s)
 }
