@@ -34,6 +34,35 @@ impl TextExtractor {
         segments
     }
 
+    /// Extract one JSON value that is *not* part of the issue payload — a
+    /// comment body fetched from a page after the first — naming it as if it sat
+    /// at `path`.
+    ///
+    /// The value is walked exactly like a field inside `fields`, so an ADF
+    /// comment body fetched on demand yields the same segments, with the same
+    /// sub-paths, as the same body arriving inside the payload. Nested values
+    /// produce several segments; a body with no text at all produces none.
+    pub fn extract_at(&self, path: &str, value: &Value) -> Vec<TextSegment> {
+        let mut segments = Vec::new();
+        self.walk_value(path, value, &mut segments);
+        segments
+    }
+
+    /// Wrap raw text that never had a JSON field — an attachment body — in a
+    /// [`TextSegment`], truncated by exactly the rule
+    /// [`TextExtractor::extract`] applies to a field.
+    ///
+    /// The truncation is the point: it is the bound on how much text one
+    /// segment can hand to the regex engine, and text fetched on demand must not
+    /// be able to raise it.
+    pub fn segment(&self, field_path: String, text: &str, source_type: SourceType) -> TextSegment {
+        TextSegment {
+            field_path,
+            text: self.truncate(text),
+            source_type,
+        }
+    }
+
     fn walk_fields(&self, value: &Value, path: &str, segments: &mut Vec<TextSegment>) {
         if let Value::Object(map) = value {
             for (key, val) in map {
@@ -158,5 +187,54 @@ mod tests {
         let segments = extractor.extract("T-1", &fields);
         assert!(segments[0].text.len() <= 1024);
         assert_eq!(segments[0].text, "🔥".repeat(256));
+    }
+
+    /// A comment fetched from a later page must be named and classified exactly
+    /// like a comment that arrived inside the issue payload.
+    #[test]
+    fn extract_at_names_a_detached_value_like_a_payload_field() {
+        let extractor = TextExtractor::new(2048);
+        let in_payload = extractor.extract(
+            "T-1",
+            &json!({"comment": {"comments": [{"body": "AKIAIOSFODNN7EXAMPLE"}]}}),
+        );
+        let detached =
+            extractor.extract_at("comment.comments[0].body", &json!("AKIAIOSFODNN7EXAMPLE"));
+        assert_eq!(detached.len(), 1);
+        assert_eq!(detached[0].field_path, in_payload[0].field_path);
+        assert_eq!(detached[0].source_type, SourceType::Comment);
+        assert_eq!(detached[0].text, in_payload[0].text);
+    }
+
+    /// An ADF body is an object; walking it from `extract_at` must reach its
+    /// text leaves, not stringify the JSON.
+    #[test]
+    fn extract_at_walks_a_nested_body() {
+        let extractor = TextExtractor::new(2048);
+        let segments = extractor.extract_at(
+            "comment.comments[3].body",
+            &json!({"type": "doc", "content": [{"type": "text", "text": "ghp_secret"}]}),
+        );
+        assert!(segments
+            .iter()
+            .any(|s| s.text == "ghp_secret" && s.source_type == SourceType::Comment));
+        assert!(segments
+            .iter()
+            .all(|s| s.field_path.starts_with("comment.comments[3].body")));
+    }
+
+    /// `segment` is the attachment path: raw text, the caller's source type, and
+    /// the same truncation a field gets.
+    #[test]
+    fn segment_truncates_like_a_field() {
+        let extractor = TextExtractor::new(1);
+        let segment = extractor.segment(
+            "attachment[big.log]".to_string(),
+            &"A".repeat(2000),
+            SourceType::Attachment,
+        );
+        assert_eq!(segment.text.len(), 1024);
+        assert_eq!(segment.field_path, "attachment[big.log]");
+        assert_eq!(segment.source_type, SourceType::Attachment);
     }
 }

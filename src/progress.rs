@@ -21,12 +21,23 @@ use indicatif::ProgressBar;
 /// - `findings_found` — findings found before deduplication, i.e. the sum over
 ///   issues of the findings each issue reported; `ScanRun::findings_total` is
 ///   the post-dedup number and is normally smaller.
+/// - `comments_scanned` — comment bodies whose text was handed to the
+///   detectors, each counted once however many segments its body was walked
+///   into. It includes the first page that arrives inside the issue payload,
+///   which is scanned whatever `--comments-mode` says: the mode only decides
+///   whether the pages after the first are fetched.
+/// - `attachments_scanned` — attachments whose text was fetched and handed to
+///   the detectors, i.e. exactly the size of the `attachment[<name>]` segment
+///   set. Attachments skipped (not text, over a limit, foreign URL) and
+///   attachments that failed to download are not counted here.
 /// - `errors_count` — issues whose processing failed (a subset of
 ///   `issues_done`).
 pub struct ScanProgress {
     pub issues_total: AtomicU64, // Jira-total (or max_issues), grows with pages
     pub issues_done: AtomicU64,  // issues processed, including failed ones
     pub findings_found: AtomicU64, // findings found (pre-dedup)
+    pub comments_scanned: AtomicU64,
+    pub attachments_scanned: AtomicU64,
     pub errors_count: AtomicU64,
     pub started_at: Instant,
     bar: Option<ProgressBar>,
@@ -39,6 +50,8 @@ impl ScanProgress {
             issues_total: AtomicU64::new(0),
             issues_done: AtomicU64::new(0),
             findings_found: AtomicU64::new(0),
+            comments_scanned: AtomicU64::new(0),
+            attachments_scanned: AtomicU64::new(0),
             errors_count: AtomicU64::new(0),
             started_at: Instant::now(),
             bar: None,
@@ -74,6 +87,19 @@ impl ScanProgress {
             bar.inc(1);
             bar.set_message(self.summary());
         }
+    }
+
+    /// Record the comment bodies of one finished issue. See the type-level
+    /// note on `comments_scanned`.
+    pub fn record_comments(&self, comments: u64) {
+        self.comments_scanned.fetch_add(comments, Ordering::Relaxed);
+    }
+
+    /// Record the attachments of one finished issue. See the type-level note on
+    /// `attachments_scanned`.
+    pub fn record_attachments(&self, attachments: u64) {
+        self.attachments_scanned
+            .fetch_add(attachments, Ordering::Relaxed);
     }
 
     /// Record one finished issue that errored out.
@@ -128,7 +154,21 @@ mod tests {
         assert_eq!(progress.issues_total.load(Ordering::Relaxed), 0);
         assert_eq!(progress.issues_done.load(Ordering::Relaxed), 0);
         assert_eq!(progress.findings_found.load(Ordering::Relaxed), 0);
+        assert_eq!(progress.comments_scanned.load(Ordering::Relaxed), 0);
+        assert_eq!(progress.attachments_scanned.load(Ordering::Relaxed), 0);
         assert_eq!(progress.errors_count.load(Ordering::Relaxed), 0);
+    }
+
+    /// The content counters accumulate across issues, which is what makes
+    /// `ScanRun::comments_scanned` / `attachments_scanned` a scan total.
+    #[test]
+    fn content_counters_accumulate() {
+        let progress = ScanProgress::new();
+        progress.record_comments(2);
+        progress.record_comments(1);
+        progress.record_attachments(3);
+        assert_eq!(progress.comments_scanned.load(Ordering::Relaxed), 3);
+        assert_eq!(progress.attachments_scanned.load(Ordering::Relaxed), 3);
     }
 
     /// Documented contract: a failed issue counts as a finished issue.

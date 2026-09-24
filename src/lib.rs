@@ -1,5 +1,6 @@
 pub mod alert;
 pub mod allowlist;
+pub mod attachments;
 pub mod checkpoint;
 pub mod config;
 pub mod credpair;
