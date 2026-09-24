@@ -121,7 +121,13 @@ pub struct Config {
     #[arg(long, env = "SCAN_COMMENTS_MODE", default_value = "all", value_parser = ["none", "all"])]
     pub comments_mode: String,
 
-    /// Scan attachments (experimental)
+    /// Scan the bodies of text attachments, on top of the issue text
+    ///
+    /// Off by default. When enabled, an attachment whose extension or MIME type
+    /// marks it as text is downloaded and scanned like any other text; archives,
+    /// images, PDFs, office documents and binaries are never fetched. Bounded by
+    /// `--max-attachment-size-mb` per file, and by 20 attachments / 32 MiB per
+    /// issue.
     #[arg(long, env = "SCAN_ATTACHMENTS_ENABLED", default_value = "false")]
     pub scan_attachments: bool,
 
