@@ -220,26 +220,27 @@ enum CliCommand {
 }
 
 /// Validate the report format list: comma-separated known formats.
+///
+/// The names come from [`crate::report::FORMAT_NAMES`], the same table the report
+/// writers are dispatched from, so `--format` can no longer accept a name that
+/// nothing writes (or reject one that something does). `all` is accepted here and
+/// leaves the expansion to `report::resolve_formats`, which owns it.
 fn parse_formats(s: &str) -> Result<String, String> {
-    const VALID: &[&str] = &[
-        "json",
-        "ndjson",
-        "csv",
-        "sarif",
-        "summary",
-        "defectdojo",
-        "all",
-    ];
     for f in s.split(',') {
         let f = f.trim();
-        if f.is_empty() || !VALID.contains(&f) {
+        if f.is_empty() || !accepted_format(f) {
             return Err(format!(
-                "unknown report format '{f}', expected one of: {}",
-                VALID.join(", ")
+                "unknown report format '{f}', expected one of: {}, all",
+                crate::report::FORMAT_NAMES.join(", ")
             ));
         }
     }
     Ok(s.to_string())
+}
+
+/// Whether `--format` accepts this single (already trimmed) name.
+fn accepted_format(name: &str) -> bool {
+    name == "all" || crate::report::FORMAT_NAMES.contains(&name)
 }
 
 /// Resolve the personal access token from its three sources.
@@ -572,6 +573,32 @@ mod tests {
         );
         assert_eq!(MetricsFormat::parse_opt("text"), None);
         assert_eq!(MetricsFormat::default(), MetricsFormat::Json);
+    }
+
+    /// `--format` accepts exactly the names the report catalogue can write, plus
+    /// `all`. The list used to be a second literal here; this pins the coupling
+    /// from the configuration side, so a format added to `report` is accepted
+    /// (and one removed is rejected) without a second edit.
+    #[test]
+    fn report_formats_come_from_the_catalogue() {
+        for name in crate::report::FORMAT_NAMES {
+            assert!(accepted_format(name), "{name} must be accepted");
+            assert!(parse_formats(name).is_ok());
+        }
+        assert!(accepted_format("all"));
+        assert!(parse_formats("json, all").is_ok());
+        assert!(parse_formats("json,ndjson,csv,sarif,summary,defectdojo,all").is_ok());
+
+        assert!(!accepted_format("xml"));
+        assert!(parse_formats("").is_err());
+        assert!(parse_formats("json,,csv").is_err());
+        assert!(parse_formats(" json , xml ").is_err());
+
+        let err = parse_formats("xml").expect_err("xml is not a report format");
+        assert!(err.contains("unknown report format 'xml'"), "{err}");
+        for name in crate::report::FORMAT_NAMES {
+            assert!(err.contains(name), "the message must list {name}: {err}");
+        }
     }
 
     #[test]
