@@ -2,6 +2,7 @@ use std::sync::OnceLock;
 
 use fancy_regex::Regex;
 
+use crate::candidate::PlaceholderPolicy;
 use crate::error::ScannerError;
 use crate::hash::secret_hash;
 use crate::redact;
@@ -371,40 +372,27 @@ fn capture_spans<'a>(re: &Regex, text: &'a str) -> Vec<(usize, &'a str)> {
 }
 
 /// Check if a value matches known placeholder patterns.
+///
+/// The dictionary and the semantics both live in [`crate::candidate`] now: this is
+/// the credential-pair detector's historical check — value equality against the
+/// shared dictionary, plus template markers (`<...>`, `${...}`, `{{...}}`) — and it
+/// is exactly [`PlaceholderPolicy::exact`].
 fn is_placeholder(value: &str) -> bool {
-    let lower = value.to_lowercase();
-    let placeholders = [
-        "password",
-        "secret",
-        "changeme",
-        "example",
-        "your_secret_here",
-        "redacted",
-        "xxxxxx",
-        "dummy",
-        "test",
-        "placeholder",
-    ];
-
-    if placeholders.iter().any(|p| lower == *p) {
-        return true;
-    }
-
-    // Template patterns: <...>, ${...}, {{...}}
-    if value.starts_with('<') && value.ends_with('>') {
-        return true;
-    }
-    if value.starts_with("${") && value.ends_with('}') {
-        return true;
-    }
-    if value.starts_with("{{") && value.ends_with("}}") {
-        return true;
-    }
-
-    false
+    PLACEHOLDERS.matches(value)
 }
 
-/// Public wrapper for is_placeholder check used by pipeline.
+/// The detector's placeholder policy: [`PlaceholderPolicy::exact`], i.e. the one
+/// copy of the dictionary in [`crate::candidate`] read in `Exact` mode.
+const PLACEHOLDERS: PlaceholderPolicy = PlaceholderPolicy::exact();
+
+/// Legacy wrapper for [`is_placeholder`], kept only for callers outside this
+/// module.
+///
+/// The pipeline no longer needs it — it judges candidates through
+/// [`crate::candidate::Judge`], which applies the same policy — so new code should
+/// use [`PlaceholderPolicy::exact`] (or the policy its own call site is specified
+/// to use) directly. Detection behaviour is identical to the pre-refactor
+/// function.
 pub fn is_placeholder_static(value: &str) -> bool {
     is_placeholder(value)
 }
@@ -729,5 +717,28 @@ mod tests {
         assert!(is_placeholder_static("<password>"));
         assert!(is_placeholder_static("${DB_PASS}"));
         assert!(!is_placeholder_static("hunter2secret"));
+    }
+
+    #[test]
+    fn test_placeholder_check_is_the_shared_policy() {
+        // The detector holds no private word list any more: every probe agrees with
+        // `candidate`'s one dictionary in `Exact` mode, `xxxx` included — it is a
+        // placeholder for the rules engine (substring) but a valid password here
+        // (equality).
+        for value in [
+            "changeme",
+            "your_key",
+            "xxxx",
+            "secret",
+            "xxxxxx",
+            "${DB_PASS}",
+            "hunter2secret",
+        ] {
+            assert_eq!(
+                is_placeholder_static(value),
+                PlaceholderPolicy::exact().matches(value),
+                "wrapper and policy disagree on {value}"
+            );
+        }
     }
 }

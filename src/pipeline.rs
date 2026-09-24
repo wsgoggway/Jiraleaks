@@ -11,15 +11,14 @@ use tracing::{debug, info, warn};
 
 use crate::allowlist::AllowlistFilter;
 use crate::attachments::{self, AttachmentPolicy};
+use crate::candidate::{Candidate, Judge, Verdict};
 use crate::config::Config;
 use crate::credpair::CredentialPairDetector;
 use crate::dedup::Deduplicator;
 use crate::error::ScannerError;
 use crate::extract::{SourceType, TextExtractor, TextSegment};
 use crate::fetcher::{FetchOptions, Fetcher};
-use crate::finding::{
-    self, Confidence, Finding, FindingStatus, Location, ScanRun, ScanStatus, Severity,
-};
+use crate::finding::{Confidence, Finding, FindingStatus, Location, ScanRun, ScanStatus, Severity};
 use crate::hash::secret_hash;
 use crate::jira::client::JiraClient;
 use crate::jira::models::Issue;
@@ -432,6 +431,9 @@ async fn process_issue(
     let mut findings: Vec<Finding> = Vec::new();
     let mut issue_findings_count = 0usize;
 
+    // The judge holds no state, so one value serves every hit of the issue.
+    let judge = Judge::new();
+
     for segment in &segments {
         if issue_findings_count >= config.max_findings_per_issue {
             warn!(
@@ -451,59 +453,42 @@ async fn process_issue(
 
             let secret_hash = secret_hash(&hit.matched_value);
 
-            // Allowlist check
-            if allowlist.is_allowed(
-                &hit.matched_value,
+            // Allowlist, the placeholder check, the context boost, the confidence
+            // adjustment and the min-confidence floor are one call into
+            // `candidate::Judge`: that chain used to be inline here, and a
+            // rejected candidate was dropped without a trace. The judge logs the
+            // reason of every drop it decides.
+            let candidate = Candidate {
+                value: &hit.matched_value,
+                text: &segment.text,
+                value_span: hit.match_span.clone(),
+                field_path: &hit.field_path,
+                issue_key: &issue_key,
+            };
+
+            // `AllowlistFilter::is_allowed` reports only *whether* an entry
+            // matched, never which one, so the verdict cannot carry the entry's
+            // audit `reason`: the allowlist logs that itself, and this passes
+            // `None`.
+            let allowlisted = allowlist
+                .is_allowed(
+                    &hit.matched_value,
+                    &hit.rule_id,
+                    &issue_key,
+                    &hit.field_path,
+                )
+                .then_some(None);
+
+            let confidence = match judge.finalize(
                 &hit.rule_id,
-                &issue_key,
-                &hit.field_path,
-            ) {
-                debug!(
-                    rule_id = %hit.rule_id,
-                    issue = %issue_key,
-                    "Finding excluded by allowlist"
-                );
-                continue;
-            }
-
-            // Placeholder check
-            let is_placeholder = crate::credpair::is_placeholder_static(&hit.matched_value);
-
-            // Context keyword check: look for secret-related words around the match
-            const CONTEXT_WORDS: &[&str] = &[
-                "secret",
-                "key",
-                "token",
-                "password",
-                "passwd",
-                "pwd",
-                "credential",
-                "api_key",
-                "apikey",
-                "access_key",
-                "private_key",
-            ];
-            let win_start = segment
-                .text
-                .floor_char_boundary(hit.match_span.start.saturating_sub(50));
-            let win_end = segment
-                .text
-                .ceil_char_boundary((hit.match_span.end + 50).min(segment.text.len()));
-            let window = &segment.text[win_start..win_end].to_lowercase();
-            let has_context = CONTEXT_WORDS.iter().any(|w| window.contains(w));
-
-            // Confidence adjustment
-            let confidence = finding::adjust_confidence(
                 Confidence::parse(&hit.confidence),
-                has_context,
-                crate::entropy::shannon(&hit.matched_value) > 3.5,
-                is_placeholder,
-            );
-
-            // Filter by min-confidence
-            if confidence < Confidence::parse(&config.min_confidence) {
-                continue;
-            }
+                &candidate,
+                allowlisted,
+                Confidence::parse(&config.min_confidence),
+            ) {
+                Verdict::Keep { confidence, .. } => confidence,
+                Verdict::Drop(_) => continue,
+            };
 
             // A snippet is a ±50 byte window, so it can carry the secrets of the
             // neighbouring findings of the same segment: the hit masks those too.

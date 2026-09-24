@@ -4,32 +4,12 @@ use std::ops::Range;
 use fancy_regex::Regex;
 use serde::Deserialize;
 
-use crate::entropy;
+use crate::candidate::{Candidate, Judge, PlaceholderPolicy};
 use crate::redact;
-use crate::validators;
 
-/// Placeholder markers filtered out by default for every rule unless
-/// `disable_default_placeholders` is set. Mirrors kingfisher's default
-/// placeholder handling to cut false positives on documentation examples.
-/// NOTE: no bare digit runs here — "contains" semantics would reject any
-/// real token embedding them (e.g. `1234567890:` telegram ids, `123456789012`
-/// slack workspaces).
-const DEFAULT_PLACEHOLDERS: &[&str] = &[
-    "example",
-    "test",
-    "sample",
-    "demo",
-    "dummy",
-    "placeholder",
-    "changeme",
-    "your_key",
-    "yourkey",
-    "your-key",
-    "xxxx",
-    "foobar",
-    "redacted",
-    "fake",
-];
+/// The judge the rules engine filters with: it owns no per-scan state, so one
+/// value serves every scan.
+static JUDGE: Judge = Judge::new();
 
 fn default_special_chars() -> String {
     "!@#$%^&*()_+-=[]{}|;:,.<>?/".into()
@@ -216,7 +196,13 @@ impl CompiledRule {
         let mut eff_ignore: Vec<String> = if rule.disable_default_placeholders {
             Vec::new()
         } else {
-            DEFAULT_PLACEHOLDERS.iter().map(|s| s.to_string()).collect()
+            // The default placeholder list comes from the crate's one dictionary
+            // (`candidate::PLACEHOLDER_WORDS`, `Contains` mode) instead of a copy
+            // kept here.
+            PlaceholderPolicy::contains()
+                .words()
+                .map(str::to_string)
+                .collect()
         };
         eff_ignore.extend(rule.ignore_if_contains.iter().cloned());
 
@@ -324,8 +310,18 @@ impl RulesEngine {
                             (match_start, match_end, m.as_str().to_string())
                         };
 
-                        if !self.passes_filters(rule, &matched_value, text, value_start..value_end)
-                        {
+                        let candidate = Candidate {
+                            value: &matched_value,
+                            text,
+                            value_span: value_start..value_end,
+                            field_path,
+                            // The rules engine scans text, not issues: the key is
+                            // filled in by the pipeline and only the drop log of
+                            // the post-scan half reads it.
+                            issue_key: "",
+                        };
+
+                        if !self.passes_filters(rule, &candidate) {
                             cursor = match_end;
                             continue;
                         }
@@ -367,107 +363,27 @@ impl RulesEngine {
         hits
     }
 
-    fn passes_filters(
-        &self,
-        rule: &CompiledRule,
-        value: &str,
-        text: &str,
-        value_span: Range<usize>,
-    ) -> bool {
-        if let Some(min_len) = rule.min_length {
-            if value.chars().count() < min_len {
-                return false;
+    /// Whether a regex match survives the rule's own filters.
+    ///
+    /// The chain itself lives in [`candidate::Judge::rule_filters`]; this is the
+    /// call site plus the observability that was missing while every rejection was
+    /// a bare `return false` — a rejected candidate is now logged with the reason,
+    /// at debug level. The value is never logged, and the issue key is unknown
+    /// here (the rules engine scans text, not issues), which is why the candidate
+    /// carries an empty one.
+    fn passes_filters(&self, rule: &CompiledRule, cand: &Candidate<'_>) -> bool {
+        match JUDGE.rule_filters(rule, cand) {
+            Ok(()) => true,
+            Err(reason) => {
+                tracing::debug!(
+                    rule_id = %rule.rule_id,
+                    field_path = %cand.field_path,
+                    reason = %reason,
+                    "Candidate dropped by rule filters"
+                );
+                false
             }
         }
-
-        if let Some(min_ent) = rule.min_entropy {
-            if entropy::shannon(value) < min_ent {
-                return false;
-            }
-        }
-
-        if !rule.denylist.is_empty() {
-            let lower = value.to_lowercase();
-            if rule
-                .denylist
-                .iter()
-                .any(|d| lower.contains(&d.to_lowercase()))
-            {
-                return false;
-            }
-        }
-
-        // Placeholder / ignore_if_contains (effective list incl. global default)
-        if !rule.ignore_if_contains.is_empty() {
-            let lower = value.to_lowercase();
-            if rule
-                .ignore_if_contains
-                .iter()
-                .any(|d| lower.contains(&d.to_lowercase()))
-            {
-                return false;
-            }
-        }
-
-        // Character-class requirements (kingfisher pattern_requirements)
-        let mut digits = 0usize;
-        let mut upper = 0usize;
-        let mut lower_cnt = 0usize;
-        let mut special = 0usize;
-        for c in value.chars() {
-            if c.is_ascii_digit() {
-                digits += 1;
-            } else if c.is_ascii_uppercase() {
-                upper += 1;
-            } else if c.is_ascii_lowercase() {
-                lower_cnt += 1;
-            } else if rule.special_chars.contains(&c) {
-                special += 1;
-            }
-        }
-        if let Some(n) = rule.min_digits {
-            if digits < n {
-                return false;
-            }
-        }
-        if let Some(n) = rule.min_uppercase {
-            if upper < n {
-                return false;
-            }
-        }
-        if let Some(n) = rule.min_lowercase {
-            if lower_cnt < n {
-                return false;
-            }
-        }
-        if let Some(n) = rule.min_special_chars {
-            if special < n {
-                return false;
-            }
-        }
-
-        if !rule.context_keywords.is_empty() {
-            let win_start = text.floor_char_boundary(value_span.start.saturating_sub(50));
-            let win_end = text.ceil_char_boundary((value_span.end + 50).min(text.len()));
-            let window = &text[win_start..win_end].to_lowercase();
-
-            let found = rule
-                .context_keywords
-                .iter()
-                .any(|kw| window.contains(&kw.to_lowercase()));
-
-            if !found {
-                return false;
-            }
-        }
-
-        if let Some(ref validator) = rule.validator {
-            if !validators::validate(validator, value) {
-                return false;
-            }
-        }
-
-        true
     }
 }
 
@@ -506,14 +422,20 @@ mod tests {
         let value_with_digits = "Abc123Xyz9+abcAbc123Xyz9+abcAbc123Xyz9+abc";
         let text = format!("aws_secret_access_key = {value_with_digits}");
         assert!(
-            engine.passes_filters(rule, value_with_digits, &text, 0..value_with_digits.len()),
+            engine.passes_filters(
+                rule,
+                &candidate(value_with_digits, &text, 0..value_with_digits.len())
+            ),
             "value with >=3 digits passes min_digits: 3"
         );
 
         let value_no_digits = "AbcdefghijAbcdefghijAbcdefghijAbcdefghij";
         let text = format!("aws_secret_access_key = {value_no_digits}");
         assert!(
-            !engine.passes_filters(rule, value_no_digits, &text, 0..value_no_digits.len()),
+            !engine.passes_filters(
+                rule,
+                &candidate(value_no_digits, &text, 0..value_no_digits.len())
+            ),
             "value without digits is rejected by min_digits: 3"
         );
     }
@@ -560,6 +482,18 @@ mod tests {
 
     fn yaml_rule(yaml: &str) -> Rule {
         serde_yaml::from_str(yaml).expect("valid rule yaml")
+    }
+
+    /// A candidate for the rules-engine call sites: the engine never knows the
+    /// issue, so the key is empty here just as it is in `scan`.
+    fn candidate<'a>(value: &'a str, text: &'a str, span: Range<usize>) -> Candidate<'a> {
+        Candidate {
+            value,
+            text,
+            value_span: span,
+            field_path: "test_field",
+            issue_key: "",
+        }
     }
 
     #[test]
