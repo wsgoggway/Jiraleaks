@@ -33,8 +33,9 @@
 //! naive JQL timestamp in the time zone of the requesting user's profile: a
 //! profile *behind* UTC shifts the window that many hours later and can hide
 //! issues from it. The five-minute overlap absorbs clock skew, not a time-zone
-//! offset — an instance whose Jira profile is not on UTC needs the overlap raised
-//! (see the `--incremental` note in `README.md`).
+//! offset — an instance whose Jira profile is not on UTC needs the overlap raised,
+//! which is a change to [`WINDOW_OVERLAP`] and a rebuild, not a flag (see the
+//! `--incremental` note in `README.md`).
 
 use std::fs;
 use std::path::{Path, PathBuf};

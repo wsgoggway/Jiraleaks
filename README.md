@@ -182,7 +182,9 @@ the previous scan finished, the **configured** JQL, the Jira base URL, and the s
 **Time zone caveat.** The timestamp is written as naive UTC (`yyyy-MM-dd HH:mm`), and Jira
 reads a naive JQL timestamp in the time zone of the requesting user's profile. On an instance
 whose Jira profile is not on UTC the window shifts by that offset; the five-minute overlap
-absorbs clock skew, not a time-zone difference, so raise the overlap for such an instance.
+absorbs clock skew, not a time-zone difference. The overlap is not configurable: it is the
+`WINDOW_OVERLAP` constant in `src/checkpoint.rs` (five minutes), so an instance that needs a
+wider one needs a code change and a rebuild, not a flag.
 
 Without the flag nothing incremental happens: `--incremental` is the only thing that both
 reads and writes a checkpoint.
