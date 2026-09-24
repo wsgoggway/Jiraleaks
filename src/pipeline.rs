@@ -1,7 +1,7 @@
+use std::collections::HashSet;
 use std::io::IsTerminal;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::collections::HashSet;
 use std::time::Duration;
 
 use indicatif::{ProgressBar, ProgressStyle};
@@ -16,7 +16,9 @@ use crate::dedup::Deduplicator;
 use crate::error::ScannerError;
 use crate::extract::TextExtractor;
 use crate::fetcher::Fetcher;
-use crate::finding::{self, Confidence, Finding, FindingStatus, Location, ScanRun, ScanStatus, Severity};
+use crate::finding::{
+    self, Confidence, Finding, FindingStatus, Location, ScanRun, ScanStatus, Severity,
+};
 use crate::hash::secret_hash;
 use crate::jira::client::JiraClient;
 use crate::jira::models::Issue;
@@ -26,7 +28,10 @@ use crate::report;
 use crate::rules::RulesEngine;
 
 /// Run the full scanning pipeline (spec §11.2).
-pub async fn run(config: Config, client: JiraClient) -> Result<std::process::ExitCode, ScannerError> {
+pub async fn run(
+    config: Config,
+    client: JiraClient,
+) -> Result<std::process::ExitCode, ScannerError> {
     let started_at = time::OffsetDateTime::now_utc();
     let scan_id = uuid::Uuid::new_v4().to_string();
 
@@ -60,10 +65,9 @@ pub async fn run(config: Config, client: JiraClient) -> Result<std::process::Exi
     {
         let cancel_clone = cancel.clone();
         tokio::spawn(async move {
-            let mut sigterm = tokio::signal::unix::signal(
-                tokio::signal::unix::SignalKind::terminate(),
-            )
-            .expect("Failed to register SIGTERM handler");
+            let mut sigterm =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("Failed to register SIGTERM handler");
             sigterm.recv().await;
             info!("Received SIGTERM, initiating graceful shutdown...");
             cancel_clone.cancel();
@@ -87,8 +91,9 @@ pub async fn run(config: Config, client: JiraClient) -> Result<std::process::Exi
     progress.set_bar(bar);
     let progress = Arc::new(progress);
 
-    let (mut issue_rx, fetch_handle) =
-        fetcher.fetch_issues_stream(jql, cancel.clone(), progress.clone()).await;
+    let (mut issue_rx, fetch_handle) = fetcher
+        .fetch_issues_stream(jql, cancel.clone(), progress.clone())
+        .await;
 
     // Periodic ticker keeps the bar's spinner/ETA fresh during quiet periods
     let progress_tick = tokio::spawn({
@@ -120,7 +125,13 @@ pub async fn run(config: Config, client: JiraClient) -> Result<std::process::Exi
         }
         // backpressure: keep at most concurrency*2 tasks in flight
         while join_set.len() >= config.concurrency * 2 {
-            collect_one(&mut join_set, &mut all_findings, &mut errors_total, &progress).await;
+            collect_one(
+                &mut join_set,
+                &mut all_findings,
+                &mut errors_total,
+                &progress,
+            )
+            .await;
         }
         scanned_issue_keys.insert(issue.key.clone());
         let client = client.clone();
@@ -143,7 +154,14 @@ pub async fn run(config: Config, client: JiraClient) -> Result<std::process::Exi
     }
 
     // Drain all remaining tasks
-    while collect_one(&mut join_set, &mut all_findings, &mut errors_total, &progress).await {}
+    while collect_one(
+        &mut join_set,
+        &mut all_findings,
+        &mut errors_total,
+        &progress,
+    )
+    .await
+    {}
 
     progress_tick.abort();
 
@@ -173,7 +191,12 @@ pub async fn run(config: Config, client: JiraClient) -> Result<std::process::Exi
     };
     if let Some(ref store) = store {
         findings = store
-            .reconcile(&findings, &scanned_issue_keys, &scan_id, &started_at_rfc3339)
+            .reconcile(
+                &findings,
+                &scanned_issue_keys,
+                &scan_id,
+                &started_at_rfc3339,
+            )
             .await?;
     }
 
@@ -234,11 +257,7 @@ pub async fn run(config: Config, client: JiraClient) -> Result<std::process::Exi
 
     // Write metrics if configured
     if let Some(ref metrics_path) = config.metrics_path {
-        crate::metrics::write_metrics(
-            metrics_path,
-            &config.metrics_format,
-            &scan_run,
-        )?;
+        crate::metrics::write_metrics(metrics_path, &config.metrics_format, &scan_run)?;
     }
 
     // Send alerts if configured
@@ -329,7 +348,10 @@ async fn process_issue(
                 .map(|a| a.len() as u64)
                 .unwrap_or(0);
             if total > existing_count {
-                match client.get_comments_paginated(&issue_key, existing_count, 50).await {
+                match client
+                    .get_comments_paginated(&issue_key, existing_count, 50)
+                    .await
+                {
                     Ok(mut page) => extra_comments.append(&mut page.comments),
                     Err(e) => {
                         warn!(issue = %issue_key, error = %e, "Failed to fetch extra comments");
@@ -354,7 +376,7 @@ async fn process_issue(
 
         // 1. Regex rule scanning
         let hits = rules_engine.scan(&segment.text, &segment.field_path);
-        for hit in hits {
+        for hit in hits.iter() {
             if issue_findings_count >= config.max_findings_per_issue {
                 break;
             }
@@ -381,13 +403,24 @@ async fn process_issue(
 
             // Context keyword check: look for secret-related words around the match
             const CONTEXT_WORDS: &[&str] = &[
-                "secret", "key", "token", "password", "passwd", "pwd",
-                "credential", "api_key", "apikey", "access_key", "private_key",
+                "secret",
+                "key",
+                "token",
+                "password",
+                "passwd",
+                "pwd",
+                "credential",
+                "api_key",
+                "apikey",
+                "access_key",
+                "private_key",
             ];
-            let win_start = segment.text.floor_char_boundary(hit.start.saturating_sub(50));
+            let win_start = segment
+                .text
+                .floor_char_boundary(hit.match_span.start.saturating_sub(50));
             let win_end = segment
                 .text
-                .ceil_char_boundary((hit.end + 50).min(segment.text.len()));
+                .ceil_char_boundary((hit.match_span.end + 50).min(segment.text.len()));
             let window = &segment.text[win_start..win_end].to_lowercase();
             let has_context = CONTEXT_WORDS.iter().any(|w| window.contains(w));
 
@@ -404,25 +437,10 @@ async fn process_issue(
                 continue;
             }
 
+            // A snippet is a ±50 byte window, so it can carry the secrets of the
+            // neighbouring findings of the same segment: the hit masks those too.
             let redacted = redact::redact(&hit.matched_value);
-            let redacted_snippet = redact::redact_snippet(
-                &hit.snippet,
-                hit.start.saturating_sub(
-                    hit.snippet.len().saturating_sub(
-                        hit.snippet
-                            .find(&hit.matched_value)
-                            .unwrap_or(0),
-                    ),
-                ),
-                hit.start.saturating_sub(
-                    hit.snippet.len().saturating_sub(
-                        hit.snippet
-                            .find(&hit.matched_value)
-                            .unwrap_or(0),
-                    ),
-                ) + hit.matched_value.len(),
-                &hit.rule_id,
-            );
+            let redacted_snippet = hit.redacted_snippet(&hits);
 
             findings.push(Finding {
                 finding_id: uuid::Uuid::new_v4().to_string(),

@@ -72,12 +72,20 @@ impl TextExtractor {
     }
 
     fn truncate(&self, text: &str) -> String {
-        let max_bytes = self.max_text_size_kb * 1024;
+        let max_bytes = self.max_text_size_kb.saturating_mul(1024);
         if text.len() <= max_bytes {
             text.to_string()
         } else {
-            tracing::warn!(original_len = text.len(), max_bytes, "Text field truncated");
-            text[..max_bytes].to_string()
+            // Never slice in the middle of a multi-byte character: a Cyrillic
+            // or emoji payload must not panic the scanner.
+            let cut_at = text.floor_char_boundary(max_bytes);
+            tracing::warn!(
+                original_len = text.len(),
+                max_bytes,
+                truncated_to = cut_at,
+                "Text field truncated"
+            );
+            text[..cut_at].to_string()
         }
     }
 }
@@ -114,7 +122,9 @@ mod tests {
             }
         });
         let segments = extractor.extract("TEST-1", &fields);
-        assert!(segments.iter().any(|s| s.text.contains("AKIAIOSFODNN7EXAMPLE")));
+        assert!(segments
+            .iter()
+            .any(|s| s.text.contains("AKIAIOSFODNN7EXAMPLE")));
         assert!(segments.iter().any(|s| s.text.contains("gh_token")));
         assert_eq!(segments.len(), 5);
     }
@@ -126,5 +136,27 @@ mod tests {
         let fields = json!({"description": long_text});
         let segments = extractor.extract("T-1", &fields);
         assert_eq!(segments[0].text.len(), 1024);
+    }
+
+    #[test]
+    fn test_truncation_on_multibyte_boundary_does_not_panic() {
+        let extractor = TextExtractor::new(1);
+        // 2 bytes per character: byte 1024 lands inside the 512th character.
+        let long_text = "я".repeat(1000);
+        let fields = json!({"description": long_text});
+        let segments = extractor.extract("T-1", &fields);
+        assert!(segments[0].text.len() <= 1024);
+        assert_eq!(segments[0].text, "я".repeat(512));
+    }
+
+    #[test]
+    fn test_truncation_with_emoji_does_not_panic() {
+        let extractor = TextExtractor::new(1);
+        // 4 bytes per emoji: byte 1024 lands inside the 256th emoji.
+        let long_text = "🔥".repeat(500);
+        let fields = json!({"description": long_text});
+        let segments = extractor.extract("T-1", &fields);
+        assert!(segments[0].text.len() <= 1024);
+        assert_eq!(segments[0].text, "🔥".repeat(256));
     }
 }
