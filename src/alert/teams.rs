@@ -44,11 +44,10 @@ pub fn send(
 
 fn build_teams_message(scan_run: &ScanRun, findings: &[&Finding]) -> String {
     let mut msg = String::new();
+    msg.push_str(&format!("**Status:** {:?}  \n", scan_run.status));
     msg.push_str(&format!(
-        "**Status:** {:?}  \n", scan_run.status
-    ));
-    msg.push_str(&format!(
-        "**Issues scanned:** {}  \n", scan_run.issues_scanned
+        "**Issues scanned:** {}  \n",
+        scan_run.issues_scanned
     ));
     msg.push_str(&format!(
         "**Findings:** {} total (Critical: {}, High: {}, Medium: {}, Low: {})  \n",
@@ -58,10 +57,7 @@ fn build_teams_message(scan_run: &ScanRun, findings: &[&Finding]) -> String {
         scan_run.findings_medium,
         scan_run.findings_low,
     ));
-    msg.push_str(&format!(
-        "**Duration:** {:.1}s  \n",
-        scan_run.duration_secs
-    ));
+    msg.push_str(&format!("**Duration:** {:.1}s  \n", scan_run.duration_secs));
 
     if !findings.is_empty() {
         msg.push_str("\n**Top findings:**  \n");

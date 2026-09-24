@@ -6,8 +6,8 @@ use indicatif::ProgressBar;
 /// Shared scan progress counters plus an optional terminal progress bar.
 /// The bar (if any) stays in sync with the counters.
 pub struct ScanProgress {
-    pub issues_total: AtomicU64,   // Jira-total (or max_issues), grows with pages
-    pub issues_done: AtomicU64,    // issues processed
+    pub issues_total: AtomicU64, // Jira-total (or max_issues), grows with pages
+    pub issues_done: AtomicU64,  // issues processed
     pub findings_found: AtomicU64, // findings found (pre-dedup)
     pub errors_count: AtomicU64,
     pub started_at: Instant,
@@ -41,7 +41,8 @@ impl ScanProgress {
     /// Record one finished issue with its pre-dedup finding count.
     pub fn finish_issue(&self, findings_delta: u64) {
         self.issues_done.fetch_add(1, Ordering::Relaxed);
-        self.findings_found.fetch_add(findings_delta, Ordering::Relaxed);
+        self.findings_found
+            .fetch_add(findings_delta, Ordering::Relaxed);
         if let Some(bar) = &self.bar {
             bar.inc(1);
             bar.set_message(self.summary());

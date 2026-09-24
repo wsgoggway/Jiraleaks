@@ -26,27 +26,19 @@ impl JiraClient {
         let auth_header = match config.auth.as_str() {
             "bearer" => format!("Bearer {}", config.pat()),
             "basic" => {
-                let email = config
-                    .email
-                    .as_deref()
-                    .unwrap_or("");
+                let email = config.email.as_deref().unwrap_or("");
                 let creds = format!("{}:{}", email, config.pat());
                 format!("Basic {}", base64_encode(&creds))
             }
             "none" => String::new(),
             other => {
-                return Err(ScannerError::Config(format!(
-                    "Unknown auth mode: {other}"
-                )));
+                return Err(ScannerError::Config(format!("Unknown auth mode: {other}")));
             }
         };
 
         let mut builder = Client::builder()
             .timeout(Duration::from_secs(config.request_timeout_secs()))
-            .user_agent(concat!(
-                "jiraleaks/",
-                env!("CARGO_PKG_VERSION")
-            ))
+            .user_agent(concat!("jiraleaks/", env!("CARGO_PKG_VERSION")))
             .gzip(true);
 
         if config.no_proxy {
@@ -93,22 +85,17 @@ impl JiraClient {
         debug!(jql, start_at, page_size, fields = %fields_param, "Searching Jira");
 
         let resp = self
-            .send(
-                self.http
-                    .get(&url)
-                    .query(&[
-                        ("jql", jql),
-                        ("startAt", &start_at.to_string()),
-                        ("maxResults", &page_size.to_string()),
-                        ("fields", &fields_param),
-                    ]),
-            )
+            .send(self.http.get(&url).query(&[
+                ("jql", jql),
+                ("startAt", &start_at.to_string()),
+                ("maxResults", &page_size.to_string()),
+                ("fields", &fields_param),
+            ]))
             .await?;
 
-        let page: SearchPage = resp
-            .json()
-            .await
-            .map_err(|e| ScannerError::ScanCritical(format!("Failed to parse search results: {e}")))?;
+        let page: SearchPage = resp.json().await.map_err(|e| {
+            ScannerError::ScanCritical(format!("Failed to parse search results: {e}"))
+        })?;
 
         Ok(page)
     }
@@ -123,11 +110,7 @@ impl JiraClient {
         let fields_param = fields.join(",");
 
         let resp = self
-            .send(
-                self.http
-                    .get(&url)
-                    .query(&[("fields", &fields_param)]),
-            )
+            .send(self.http.get(&url).query(&[("fields", &fields_param)]))
             .await?;
 
         resp.json()
@@ -145,14 +128,10 @@ impl JiraClient {
         let url = format!("{}/rest/api/2/issue/{}/comment", self.base_url, key);
 
         let resp = self
-            .send(
-                self.http
-                    .get(&url)
-                    .query(&[
-                        ("startAt", &start_at.to_string()),
-                        ("maxResults", &max_results.to_string()),
-                    ]),
-            )
+            .send(self.http.get(&url).query(&[
+                ("startAt", &start_at.to_string()),
+                ("maxResults", &max_results.to_string()),
+            ]))
             .await?;
 
         resp.json()
@@ -187,13 +166,12 @@ impl JiraClient {
     }
 
     /// Send an HTTP request with retry logic, rate limiting, and error handling.
-    async fn send(
-        &self,
-        req: reqwest::RequestBuilder,
-    ) -> Result<Response, ScannerError> {
-        let _permit = self.semaphore.acquire().await.map_err(|e| {
-            ScannerError::ScanCritical(format!("Semaphore closed: {e}"))
-        })?;
+    async fn send(&self, req: reqwest::RequestBuilder) -> Result<Response, ScannerError> {
+        let _permit = self
+            .semaphore
+            .acquire()
+            .await
+            .map_err(|e| ScannerError::ScanCritical(format!("Semaphore closed: {e}")))?;
 
         // Clone the partially-built request to add headers
         let req = req
@@ -225,8 +203,7 @@ impl JiraClient {
                         }
                         StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE => {
                             if attempt < max_retries {
-                                let delay = parse_retry_after(&resp)
-                                    .unwrap_or(backoff);
+                                let delay = parse_retry_after(&resp).unwrap_or(backoff);
                                 warn!(
                                     status = status.as_u16(),
                                     delay_ms = delay.as_millis(),
@@ -243,11 +220,7 @@ impl JiraClient {
                         }
                         s if s.is_server_error() => {
                             if attempt < max_retries {
-                                warn!(
-                                    status = s.as_u16(),
-                                    attempt,
-                                    "Server error, retrying"
-                                );
+                                warn!(status = s.as_u16(), attempt, "Server error, retrying");
                                 tokio::time::sleep(backoff).await;
                                 backoff = (backoff * 2).min(Duration::from_secs(30));
                                 continue;
@@ -279,9 +252,7 @@ impl JiraClient {
                             "Network error after {max_retries} retries: {e}"
                         )));
                     }
-                    return Err(ScannerError::JiraAccess(format!(
-                        "Request error: {e}"
-                    )));
+                    return Err(ScannerError::JiraAccess(format!("Request error: {e}")));
                 }
             }
         }

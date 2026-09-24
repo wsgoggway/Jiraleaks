@@ -6,11 +6,7 @@ use crate::finding::{Finding, ScanRun, Severity};
 use serde_json::json;
 
 /// Write findings in SARIF v2.1.0 format (spec §10.14).
-pub fn write(
-    path: &Path,
-    scan_run: &ScanRun,
-    findings: &[Finding],
-) -> Result<(), ScannerError> {
+pub fn write(path: &Path, scan_run: &ScanRun, findings: &[Finding]) -> Result<(), ScannerError> {
     let results: Vec<serde_json::Value> = findings
         .iter()
         .map(|f| {
@@ -71,13 +67,11 @@ pub fn write(
         }]
     });
 
-    let json_str = serde_json::to_string_pretty(&sarif).map_err(|e| {
-        ScannerError::ReportWrite(format!("SARIF serialization error: {e}"))
-    })?;
+    let json_str = serde_json::to_string_pretty(&sarif)
+        .map_err(|e| ScannerError::ReportWrite(format!("SARIF serialization error: {e}")))?;
 
-    fs::write(path, json_str).map_err(|e| {
-        ScannerError::ReportWrite(format!("Failed to write SARIF report: {e}"))
-    })?;
+    fs::write(path, json_str)
+        .map_err(|e| ScannerError::ReportWrite(format!("Failed to write SARIF report: {e}")))?;
 
     Ok(())
 }
@@ -88,12 +82,15 @@ fn sarif_tags(f: &Finding) -> Vec<String> {
         format!("{:?}", f.source_type).to_lowercase(),
         format!("{:?}", f.status).to_lowercase(),
     ];
-    if f.external_validation.as_ref().map(|ev| ev.valid).unwrap_or(false) {
+    if f.external_validation
+        .as_ref()
+        .map(|ev| ev.valid)
+        .unwrap_or(false)
+    {
         tags.push("live-validated".into());
     }
     tags
 }
-
 
 fn severity_to_sarif_level(severity: &Severity) -> &'static str {
     match severity {

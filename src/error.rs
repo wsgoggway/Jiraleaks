@@ -52,11 +52,29 @@ mod tests {
     #[test]
     fn test_exit_codes() {
         // ExitCode::from(1) == ExitCode::from(1) works via PartialEq
-        assert_eq!(ScannerError::Config("x".into()).exit_code(), ExitCode::from(1));
-        assert_eq!(ScannerError::JiraAccess("x".into()).exit_code(), ExitCode::from(2));
-        assert_eq!(ScannerError::ScanCritical("x".into()).exit_code(), ExitCode::from(3));
-        assert_eq!(ScannerError::ReportWrite("x".into()).exit_code(), ExitCode::from(4));
-        assert_eq!(ScannerError::Other("x".into()).exit_code(), ExitCode::from(0));
-        assert_eq!(ScannerError::Store("x".into()).exit_code(), ExitCode::from(5));
+        assert_eq!(
+            ScannerError::Config("x".into()).exit_code(),
+            ExitCode::from(1)
+        );
+        assert_eq!(
+            ScannerError::JiraAccess("x".into()).exit_code(),
+            ExitCode::from(2)
+        );
+        assert_eq!(
+            ScannerError::ScanCritical("x".into()).exit_code(),
+            ExitCode::from(3)
+        );
+        assert_eq!(
+            ScannerError::ReportWrite("x".into()).exit_code(),
+            ExitCode::from(4)
+        );
+        assert_eq!(
+            ScannerError::Other("x".into()).exit_code(),
+            ExitCode::from(0)
+        );
+        assert_eq!(
+            ScannerError::Store("x".into()).exit_code(),
+            ExitCode::from(5)
+        );
     }
 }

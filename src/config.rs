@@ -22,7 +22,13 @@ pub struct Config {
     pub auth: String,
 
     /// Personal access token (or API token for basic auth)
-    #[arg(long, env = "JIRA_PAT", alias = "JIRA_API_TOKEN", default_value = "", hide_default_value = true)]
+    #[arg(
+        long,
+        env = "JIRA_PAT",
+        alias = "JIRA_API_TOKEN",
+        default_value = "",
+        hide_default_value = true
+    )]
     #[serde(skip_serializing)]
     pat: String,
 
@@ -158,7 +164,13 @@ enum CliCommand {
 /// Validate the report format list: comma-separated known formats.
 fn parse_formats(s: &str) -> Result<String, String> {
     const VALID: &[&str] = &[
-        "json", "ndjson", "csv", "sarif", "summary", "defectdojo", "all",
+        "json",
+        "ndjson",
+        "csv",
+        "sarif",
+        "summary",
+        "defectdojo",
+        "all",
     ];
     for f in s.split(',') {
         let f = f.trim();
@@ -265,13 +277,19 @@ impl Config {
             return Err(ScannerError::Config("JIRA_URL is required".to_string()));
         }
         if self.jql.is_none() || self.jql.as_deref() == Some("") {
-            return Err(ScannerError::Config("JIRA_JQL / --jql is required".to_string()));
+            return Err(ScannerError::Config(
+                "JIRA_JQL / --jql is required".to_string(),
+            ));
         }
         if self.pat.is_empty() && self.auth != "none" {
-            return Err(ScannerError::Config("JIRA_PAT / --pat is required".to_string()));
+            return Err(ScannerError::Config(
+                "JIRA_PAT / --pat is required".to_string(),
+            ));
         }
         if self.auth == "basic" && self.email.is_none() {
-            return Err(ScannerError::Config("JIRA_EMAIL is required for basic auth".to_string()));
+            return Err(ScannerError::Config(
+                "JIRA_EMAIL is required for basic auth".to_string(),
+            ));
         }
         Ok(())
     }

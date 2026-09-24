@@ -103,7 +103,8 @@ fn test_precision_no_false_positives() {
     let precision = 1.0 - (fp as f64 / total_neg as f64);
     println!(
         "False positives: {}/{} (precision: {:.1}%)",
-        fp, total_neg,
+        fp,
+        total_neg,
         precision * 100.0
     );
     // On synthetic corpus without allowlist, expect precision >= 70%

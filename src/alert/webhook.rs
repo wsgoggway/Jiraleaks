@@ -2,11 +2,7 @@ use crate::error::ScannerError;
 use crate::finding::{Finding, ScanRun};
 
 /// Send findings to a generic webhook (SIEM, DefectDojo, etc.).
-pub fn send(
-    url: &str,
-    scan_run: &ScanRun,
-    findings: &[&Finding],
-) -> Result<(), ScannerError> {
+pub fn send(url: &str, scan_run: &ScanRun, findings: &[&Finding]) -> Result<(), ScannerError> {
     let client = reqwest::blocking::Client::new();
     let payload = serde_json::json!({
         "scanner": "jiraleaks",

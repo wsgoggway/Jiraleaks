@@ -53,7 +53,10 @@ impl Fetcher {
                 if cancel.is_cancelled() {
                     break;
                 }
-                let page = self.client.search(&jql, start_at, page_size, &fields).await?;
+                let page = self
+                    .client
+                    .search(&jql, start_at, page_size, &fields)
+                    .await?;
                 // issues_total = min(Jira-total, max_issues); max_issues==0 -> no limit
                 let total_disp = if self.config.max_issues > 0 {
                     page.total.min(self.config.max_issues as u64)
@@ -98,7 +101,9 @@ impl Fetcher {
         let mut start_at = existing_count;
 
         loop {
-            let page = client.get_comments_paginated(issue_key, start_at, 50).await?;
+            let page = client
+                .get_comments_paginated(issue_key, start_at, 50)
+                .await?;
             let count = page.comments.len();
             all_comments.extend(page.comments);
 

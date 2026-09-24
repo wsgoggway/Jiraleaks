@@ -5,23 +5,17 @@ use crate::error::ScannerError;
 use crate::finding::{Finding, ScanRun};
 
 /// Write findings as a single JSON object: `{ scan_run, findings }`.
-pub fn write(
-    path: &Path,
-    scan_run: &ScanRun,
-    findings: &[Finding],
-) -> Result<(), ScannerError> {
+pub fn write(path: &Path, scan_run: &ScanRun, findings: &[Finding]) -> Result<(), ScannerError> {
     let output = serde_json::json!({
         "scan_run": scan_run,
         "findings": findings,
     });
 
-    let json_str = serde_json::to_string_pretty(&output).map_err(|e| {
-        ScannerError::ReportWrite(format!("JSON serialization error: {e}"))
-    })?;
+    let json_str = serde_json::to_string_pretty(&output)
+        .map_err(|e| ScannerError::ReportWrite(format!("JSON serialization error: {e}")))?;
 
-    fs::write(path, json_str).map_err(|e| {
-        ScannerError::ReportWrite(format!("Failed to write JSON report: {e}"))
-    })?;
+    fs::write(path, json_str)
+        .map_err(|e| ScannerError::ReportWrite(format!("Failed to write JSON report: {e}")))?;
 
     Ok(())
 }

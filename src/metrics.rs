@@ -51,11 +51,7 @@ impl Default for Metrics {
 }
 
 /// Write metrics to a file in the specified format.
-pub fn write_metrics(
-    path: &Path,
-    format: &str,
-    scan_run: &ScanRun,
-) -> Result<(), ScannerError> {
+pub fn write_metrics(path: &Path, format: &str, scan_run: &ScanRun) -> Result<(), ScannerError> {
     match format {
         "json" => write_metrics_json(path, scan_run),
         "prom" => write_metrics_prometheus(path, scan_run),
@@ -84,13 +80,11 @@ fn write_metrics_json(path: &Path, scan_run: &ScanRun) -> Result<(), ScannerErro
         "scanner_version": scan_run.scanner_version,
     });
 
-    let json = serde_json::to_string_pretty(&metrics).map_err(|e| {
-        ScannerError::ReportWrite(format!("Metrics JSON error: {e}"))
-    })?;
+    let json = serde_json::to_string_pretty(&metrics)
+        .map_err(|e| ScannerError::ReportWrite(format!("Metrics JSON error: {e}")))?;
 
-    fs::write(path, json).map_err(|e| {
-        ScannerError::ReportWrite(format!("Failed to write metrics: {e}"))
-    })?;
+    fs::write(path, json)
+        .map_err(|e| ScannerError::ReportWrite(format!("Failed to write metrics: {e}")))?;
 
     Ok(())
 }

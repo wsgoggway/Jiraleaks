@@ -10,19 +10,18 @@ async fn test_server_info_ok() {
     Mock::given(method("GET"))
         .and(path("/rest/api/2/serverInfo"))
         .and(header("Authorization", "Bearer test-token"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(
-            serde_json::json!({
-                "baseUrl": server.uri(),
-                "version": "9.12.37",
-                "deploymentType": "Server",
-                "serverTitle": "Test Jira"
-            }),
-        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "baseUrl": server.uri(),
+            "version": "9.12.37",
+            "deploymentType": "Server",
+            "serverTitle": "Test Jira"
+        })))
         .mount(&server)
         .await;
 
     let config = Config::test_config(&server.uri(), "test-token");
-    let client = jiraleaks::jira::client::JiraClient::new(&config).expect("Failed to create client");
+    let client =
+        jiraleaks::jira::client::JiraClient::new(&config).expect("Failed to create client");
     let info = client.server_info().await.expect("server_info failed");
 
     assert_eq!(info.version, "9.12.37");
@@ -36,38 +35,35 @@ async fn test_search_pagination() {
     Mock::given(method("GET"))
         .and(path("/rest/api/2/search"))
         .and(query_param("startAt", "0"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(
-            serde_json::json!({
-                "total": 3,
-                "startAt": 0,
-                "maxResults": 50,
-                "issues": [
-                    {"id": "1", "key": "TEST-1", "fields": {}},
-                    {"id": "2", "key": "TEST-2", "fields": {}}
-                ]
-            }),
-        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "total": 3,
+            "startAt": 0,
+            "maxResults": 50,
+            "issues": [
+                {"id": "1", "key": "TEST-1", "fields": {}},
+                {"id": "2", "key": "TEST-2", "fields": {}}
+            ]
+        })))
         .mount(&server)
         .await;
 
     Mock::given(method("GET"))
         .and(path("/rest/api/2/search"))
         .and(query_param("startAt", "50"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(
-            serde_json::json!({
-                "total": 3,
-                "startAt": 50,
-                "maxResults": 50,
-                "issues": [
-                    {"id": "3", "key": "TEST-3", "fields": {}}
-                ]
-            }),
-        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "total": 3,
+            "startAt": 50,
+            "maxResults": 50,
+            "issues": [
+                {"id": "3", "key": "TEST-3", "fields": {}}
+            ]
+        })))
         .mount(&server)
         .await;
 
     let config = Config::test_config(&server.uri(), "test-token");
-    let client = jiraleaks::jira::client::JiraClient::new(&config).expect("Failed to create client");
+    let client =
+        jiraleaks::jira::client::JiraClient::new(&config).expect("Failed to create client");
 
     let page1 = client
         .search("project = TEST", 0, 50, &["summary".into()])
@@ -94,7 +90,8 @@ async fn test_401_returns_jira_access_error() {
         .await;
 
     let config = Config::test_config(&server.uri(), "test-token");
-    let client = jiraleaks::jira::client::JiraClient::new(&config).expect("Failed to create client");
+    let client =
+        jiraleaks::jira::client::JiraClient::new(&config).expect("Failed to create client");
     let result = client.server_info().await;
 
     assert!(result.is_err());
@@ -106,30 +103,26 @@ async fn test_429_with_retry_after() {
 
     Mock::given(method("GET"))
         .and(path("/rest/api/2/serverInfo"))
-        .respond_with(
-            ResponseTemplate::new(429)
-                .insert_header("Retry-After", "1"),
-        )
+        .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "1"))
         .up_to_n_times(1)
         .mount(&server)
         .await;
 
     Mock::given(method("GET"))
         .and(path("/rest/api/2/serverInfo"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(
-            serde_json::json!({
-                "baseUrl": server.uri(),
-                "version": "9.0.0",
-                "deploymentType": "Server",
-                "serverTitle": "OK"
-            }),
-        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "baseUrl": server.uri(),
+            "version": "9.0.0",
+            "deploymentType": "Server",
+            "serverTitle": "OK"
+        })))
         .up_to_n_times(1)
         .mount(&server)
         .await;
 
     let config = Config::test_config(&server.uri(), "test-token");
-    let client = jiraleaks::jira::client::JiraClient::new(&config).expect("Failed to create client");
+    let client =
+        jiraleaks::jira::client::JiraClient::new(&config).expect("Failed to create client");
     let result = client.server_info().await;
 
     assert!(result.is_ok(), "Expected success after retry: {result:?}");

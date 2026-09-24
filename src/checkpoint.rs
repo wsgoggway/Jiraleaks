@@ -46,10 +46,7 @@ pub fn read_checkpoint(config: &Config) -> Option<Checkpoint> {
 }
 
 /// Write a checkpoint after a successful scan.
-pub fn write_checkpoint(
-    config: &Config,
-    scan_run: &ScanRun,
-) -> Result<(), ScannerError> {
+pub fn write_checkpoint(config: &Config, scan_run: &ScanRun) -> Result<(), ScannerError> {
     let state_dir = &config.state_dir;
     fs::create_dir_all(state_dir).map_err(|e| {
         ScannerError::ReportWrite(format!(
@@ -74,14 +71,12 @@ pub fn write_checkpoint(
         status: "success".to_string(),
     };
 
-    let json = serde_json::to_string_pretty(&cp).map_err(|e| {
-        ScannerError::ReportWrite(format!("Checkpoint serialization error: {e}"))
-    })?;
+    let json = serde_json::to_string_pretty(&cp)
+        .map_err(|e| ScannerError::ReportWrite(format!("Checkpoint serialization error: {e}")))?;
 
     let path = checkpoint_path(config);
-    fs::write(&path, json).map_err(|e| {
-        ScannerError::ReportWrite(format!("Failed to write checkpoint: {e}"))
-    })?;
+    fs::write(&path, json)
+        .map_err(|e| ScannerError::ReportWrite(format!("Failed to write checkpoint: {e}")))?;
 
     tracing::info!(path = %path.display(), "Checkpoint written");
     Ok(())

@@ -196,7 +196,9 @@ mod tests {
     #[test]
     fn test_github_token_invalid() {
         assert!(!validate_github_token("ghp_short"));
-        assert!(!validate_github_token("abc_sbUsUmRNn8X74dFU0DJ9Fm1mvdCgtH474T38"));
+        assert!(!validate_github_token(
+            "abc_sbUsUmRNn8X74dFU0DJ9Fm1mvdCgtH474T38"
+        ));
         // Wrong checksum
         assert!(!validate_github_token(
             "ghp_sbUsUmRNn8X74dFU0DJ9Fm1mvdCgtH474T99"

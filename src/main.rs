@@ -13,12 +13,7 @@ fn main() -> ExitCode {
     if let Some(shell) = config.completions() {
         use clap::CommandFactory;
         let mut cmd = Config::command();
-        clap_complete::generate(
-            shell,
-            &mut cmd,
-            "jiraleaks",
-            &mut std::io::stdout(),
-        );
+        clap_complete::generate(shell, &mut cmd, "jiraleaks", &mut std::io::stdout());
         return ExitCode::SUCCESS;
     }
 
@@ -32,10 +27,7 @@ fn main() -> ExitCode {
         return ExitCode::from(1);
     }
 
-    tracing::info!(
-        version = env!("CARGO_PKG_VERSION"),
-        "Starting jiraleaks"
-    );
+    tracing::info!(version = env!("CARGO_PKG_VERSION"), "Starting jiraleaks");
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

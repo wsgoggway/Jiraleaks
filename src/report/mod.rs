@@ -1,9 +1,9 @@
+pub mod csv;
+pub mod defectdojo;
 pub mod json;
 pub mod ndjson;
-pub mod csv;
-pub mod summary;
 pub mod sarif;
-pub mod defectdojo;
+pub mod summary;
 
 use crate::config::Config;
 use crate::error::ScannerError;
@@ -17,14 +17,10 @@ pub fn write_reports(
 ) -> Result<(), ScannerError> {
     let now = time::OffsetDateTime::now_utc();
     let date_part = now
-        .format(&time::format_description::parse_borrowed::<1>(
-            "[year]-[month]-[day]",
-        ).unwrap())
+        .format(&time::format_description::parse_borrowed::<1>("[year]-[month]-[day]").unwrap())
         .unwrap_or_else(|_| "unknown".into());
     let time_part = now
-        .format(&time::format_description::parse_borrowed::<1>(
-            "[hour]-[minute]-[second]",
-        ).unwrap())
+        .format(&time::format_description::parse_borrowed::<1>("[hour]-[minute]-[second]").unwrap())
         .unwrap_or_else(|_| "unknown".into());
 
     let nested = config.report_layout == "nested";
@@ -239,7 +235,8 @@ mod tests {
 
     #[test]
     fn write_reports_nested_layout_single_project() {
-        let dir = std::env::temp_dir().join(format!("jiraleaks-report-nested-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("jiraleaks-report-nested-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut cfg = Config::test_config("https://jira.example.com", "tok");
         cfg.report_layout = "nested".into();
@@ -274,8 +271,10 @@ mod tests {
             ("project in (SEC, PROJ)", "_multi"),
             ("text ~ \"foo\"", "_default"),
         ] {
-            let dir = std::env::temp_dir()
-                .join(format!("jiraleaks-report-nested-{expected}-{}", std::process::id()));
+            let dir = std::env::temp_dir().join(format!(
+                "jiraleaks-report-nested-{expected}-{}",
+                std::process::id()
+            ));
             let _ = std::fs::remove_dir_all(&dir);
             let mut cfg = Config::test_config("https://jira.example.com", "tok");
             cfg.report_layout = "nested".into();
@@ -294,7 +293,8 @@ mod tests {
 
     #[test]
     fn write_reports_flat_layout() {
-        let dir = std::env::temp_dir().join(format!("jiraleaks-report-flat-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("jiraleaks-report-flat-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut cfg = Config::test_config("https://jira.example.com", "tok");
         cfg.report_layout = "flat".into();

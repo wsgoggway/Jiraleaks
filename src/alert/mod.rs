@@ -54,9 +54,8 @@ pub fn send_alerts(
         ))
     })?;
 
-    let config: AlertsConfig = serde_yaml::from_str(&yaml).map_err(|e| {
-        ScannerError::Config(format!("Failed to parse alerts config: {e}"))
-    })?;
+    let config: AlertsConfig = serde_yaml::from_str(&yaml)
+        .map_err(|e| ScannerError::Config(format!("Failed to parse alerts config: {e}")))?;
 
     // Filter findings by min_confidence
     let min_conf = match config.min_confidence.as_str() {
