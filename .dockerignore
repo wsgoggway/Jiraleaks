@@ -1,6 +1,31 @@
+# Build context hygiene: keep scan artifacts and credentials out of the image.
+
+# Build outputs and VCS/CI metadata
 target/
 .git/
-.jiraleaks-state/
+.github/
+
+# Local scan artifacts. Reports and the sqlite store carry real findings and
+# secret fragments (see .gitignore) and must never be baked into an image.
 reports/
+.jss-state/
+.jiraleaks-state/
+*.db
+*.sqlite
+*.sqlite3
+
+# Credentials, in case any leaked into the tree
+.env*
+credentials*
+secrets*
+*.key
+*.pem
+*.pfx
+*.p12
+
+# Not needed to compile the binary
+tests/
+deploy/
+justfile
 Dockerfile
-*.md
+.dockerignore
