@@ -5,6 +5,7 @@ use serde::Serialize;
 
 use crate::error::ScannerError;
 use crate::finding::{Finding, FindingKey, FindingStatus, Severity};
+use crate::report::ReportInput;
 use serde_json::json;
 
 /// A finding in DefectDojo "Generic Findings Import" JSON format.
@@ -29,9 +30,9 @@ struct DefectDojoFinding {
 }
 
 /// Write findings as a DefectDojo Generic Findings Import JSON document.
-pub fn write(path: &Path, findings: &[Finding]) -> Result<(), ScannerError> {
+pub fn write(path: &Path, input: &ReportInput<'_>) -> Result<(), ScannerError> {
     let output = json!({
-        "findings": findings.iter().map(map_finding).collect::<Vec<_>>(),
+        "findings": input.findings.iter().map(map_finding).collect::<Vec<_>>(),
     });
 
     let json_str = serde_json::to_string_pretty(&output)
@@ -91,6 +92,22 @@ pub(crate) fn unique_id_from_tool(finding: &Finding) -> String {
 }
 
 fn map_finding(f: &Finding) -> DefectDojoFinding {
+    // What the three boolean flags mean, and why they are derived this way:
+    //
+    // * `verified` — DefectDojo's "a human or a system confirmed this is real"; it
+    //   moves the finding out of the triage queue. A rule match is a *candidate*,
+    //   not a confirmation, so the only confirmation this scanner can honestly
+    //   claim is an external validation that says the credential is live
+    //   (`external_validation.valid`). Importing candidates as verified put every
+    //   unconfirmed hit into the verified bucket and hid the triage work that the
+    //   findings exist to trigger.
+    // * `active` — "still to be worked on". Closed, Resolved and FalsePositive all
+    //   say the opposite; New, Recurring and Confirmed are active.
+    // * `false_p` — the scanner already decided the finding is not a real leak.
+    //
+    // `active` and `false_p` are therefore mutually exclusive: a false positive is
+    // imported inactive. Previously both were true at once, which re-opened a
+    // finding the scan itself had dismissed.
     let live_validated = f
         .external_validation
         .as_ref()
@@ -149,8 +166,11 @@ fn map_finding(f: &Finding) -> DefectDojoFinding {
         mitigation: "Rotate the exposed credential, remove it from the Jira issue, and review who had access to the issue while it was exposed.".into(),
         references: f.issue_url.clone(),
         file_path: f.issue_key.clone(),
-        active: f.status != FindingStatus::Resolved && f.status != FindingStatus::Closed,
-        verified: true,
+        active: !matches!(
+            f.status,
+            FindingStatus::Closed | FindingStatus::Resolved | FindingStatus::FalsePositive
+        ),
+        verified: live_validated,
         false_p: f.status == FindingStatus::FalsePositive,
         duplicate: false,
         static_finding: true,
@@ -172,7 +192,43 @@ fn severity_to_dd(severity: &Severity) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::finding::{Confidence, Location, SourceType};
+    use crate::finding::{Confidence, Location, ScanRun, ScanStatus, SourceType};
+
+    fn scan_run() -> ScanRun {
+        ScanRun {
+            scan_id: "scan-1".into(),
+            status: ScanStatus::Success,
+            started_at: "2026-01-01T00:00:00Z".into(),
+            finished_at: "2026-01-01T00:00:01Z".into(),
+            jira_url: "https://jira".into(),
+            jql: "project = SEC".into(),
+            issues_scanned: 1,
+            issues_total: 1,
+            findings_total: 1,
+            findings_critical: 0,
+            findings_high: 1,
+            findings_medium: 0,
+            findings_low: 0,
+            findings_info: 0,
+            errors_total: 0,
+            comments_scanned: 0,
+            attachments_scanned: 0,
+            scanner_version: "0.1.0".into(),
+            duration_secs: 0.0,
+        }
+    }
+
+    /// A DefectDojo writer ignores the scan metadata; it needs the input only to
+    /// keep the one signature the whole catalogue shares.
+    fn write_dd(path: &Path, findings: &[Finding]) -> Result<(), ScannerError> {
+        write(
+            path,
+            &ReportInput {
+                scan_run: &scan_run(),
+                findings,
+            },
+        )
+    }
 
     fn sample_finding(status: FindingStatus) -> Finding {
         Finding {
@@ -228,7 +284,12 @@ mod tests {
             "fp:b3180ab374142f1599ac15ea04c5fd167ba1a1340d4492f801857a24035fae45#0"
         );
         assert!(dd.active);
-        assert!(dd.verified);
+        // No external validation on this finding, so nothing confirmed it: DefectDojo
+        // must show it as an active but UNverified finding, i.e. triage work.
+        assert!(
+            !dd.verified,
+            "a rule match is a candidate, not a confirmed finding"
+        );
         assert!(!dd.false_p);
         assert!(dd.static_finding);
         assert!(dd.description.contains("AKIA********EXAMPLE"));
@@ -244,7 +305,10 @@ mod tests {
     fn false_positive_and_resolved_statuses() {
         let fp = map_finding(&sample_finding(FindingStatus::FalsePositive));
         assert!(fp.false_p);
-        assert!(fp.active);
+        // A false positive is not work: it is imported inactive, not as an active
+        // false-positive the triager would meet again in the queue.
+        assert!(!fp.active, "a false positive must not be imported active");
+        assert!(!fp.verified);
         let resolved = map_finding(&sample_finding(FindingStatus::Resolved));
         assert!(!resolved.active);
         assert!(!resolved.false_p);
@@ -270,6 +334,7 @@ mod tests {
         });
         let dd = map_finding(&f);
         assert!(dd.tags.contains(&"live-validated".to_string()));
+        assert!(dd.verified, "a live validation confirms the finding");
         assert!(dd.description.contains("First seen: 2026-01-01T00:00:00Z"));
         assert!(dd.description.contains("Times seen: 3"));
         assert!(dd.description.contains("External validation: valid=true"));
@@ -280,7 +345,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("dd-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("report.json");
-        write(&path, &[sample_finding(FindingStatus::New)]).unwrap();
+        write_dd(&path, &[sample_finding(FindingStatus::New)]).unwrap();
         let doc: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         std::fs::remove_dir_all(&dir).ok();
@@ -289,6 +354,8 @@ mod tests {
         assert_eq!(findings[0]["severity"], "High");
         assert_eq!(findings[0]["title"], "aws-access-key in SEC-42");
         assert_eq!(findings[0]["active"], true);
+        assert_eq!(findings[0]["verified"], false);
+        assert_eq!(findings[0]["false_p"], false);
     }
 
     // --- stable unique_id_from_tool ---
@@ -325,7 +392,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let first = dir.join("scan1.json");
         let second = dir.join("scan2.json");
-        write(
+        write_dd(
             &first,
             &[with_finding_id(
                 sample_finding(FindingStatus::New),
@@ -333,7 +400,7 @@ mod tests {
             )],
         )
         .unwrap();
-        write(
+        write_dd(
             &second,
             &[with_finding_id(
                 sample_finding(FindingStatus::New),
