@@ -556,22 +556,23 @@ async fn a_dry_run_writes_no_report_files() {
 
 // ── store failures ──────────────────────────────────────────────────────────
 
-/// A store that cannot be opened is exit code 5 (Store), and — as the code
-/// stands today — the reports of that run are lost with it.
+/// A store that cannot be opened is exit code 5 (Store) **and** the reports of
+/// that run are still written.
 ///
-/// `pipeline::run` opens and migrates the store *before* it writes any report,
-/// so the `?` on the store error ends the run with findings already computed
-/// and no file to read them from. This test pins that behaviour so the day the
-/// order changes it fails and has to be updated deliberately; the report on this
-/// task carries it as a defect (a scan that found secrets and wrote no report
-/// must not be silent).
+/// The store is a side channel: it enriches a finding with its history (status,
+/// `times_seen`, live validation) and keeps the audit row of the run, but the
+/// findings are collected without it. A scan that found secrets must never be
+/// silent, so `pipeline::run` warns about the store, keeps going on the
+/// unenriched findings, emits the reports, metrics, alerts and checkpoint as
+/// usual, and returns the remembered store error at the very end — which is what
+/// leaves the exit code at 5 without costing the operator the report.
 ///
 /// `sqlite://<tmp>/blocker/findings.db` is used rather than an unwritable system
 /// path: `<tmp>/blocker` is a regular *file*, so creating its "parent directory"
 /// fails with `Not a directory` on any machine, root or not, without touching
 /// anything outside `std::env::temp_dir()`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_unavailable_store_exits_five_and_loses_the_reports() {
+async fn an_unavailable_store_still_writes_the_reports_and_exits_five() {
     let server = MockServer::start().await;
     mount_jira(&server).await;
 
@@ -613,20 +614,35 @@ async fn an_unavailable_store_exits_five_and_loses_the_reports() {
         stdout(&output)
     );
 
-    // Current behaviour: the run ended before the report stage.
-    let reports: Vec<PathBuf> = if report_dir.is_dir() {
-        std::fs::read_dir(&report_dir)
-            .expect("report dir readable")
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .collect()
-    } else {
-        Vec::new()
-    };
-    assert!(
-        reports.is_empty(),
-        "reports exist after a store failure — the store-before-reports order changed: {reports:?}"
+    // The findings survived the store failure: this run has no
+    // `--scan-attachments`, so the description and the comment body are the two
+    // secrets it found.
+    let json_path = report_file(&report_dir, "json");
+    let report: Value =
+        serde_json::from_str(&std::fs::read_to_string(&json_path).expect("json report readable"))
+            .expect("json report parses");
+    assert_eq!(
+        report["scan_run"]["findings_total"], 2,
+        "the findings of the scan must reach the report even when the store is gone: {report:#?}"
     );
+    assert_eq!(
+        report["findings"]
+            .as_array()
+            .expect("findings is an array")
+            .len(),
+        2,
+        "both findings must be in the report: {report:#?}"
+    );
+
+    // Every format, not only json: the report stage ran to its end.
+    for ext in ["json", "ndjson", "csv", "sarif", "txt", "defectdojo.json"] {
+        let path = report_file(&report_dir, ext);
+        assert!(
+            path.is_file() && path.metadata().expect("metadata").len() > 0,
+            "{} is empty after a store failure",
+            path.display()
+        );
+    }
 }
 
 /// An empty `--db-url` disables the store for real: the same scan, with the

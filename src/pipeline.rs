@@ -210,25 +210,56 @@ pub async fn run(
 
     // Reconcile against the persistent findings store (status history +
     // live-validation) when a database URL is configured.
+    //
+    // A store that cannot be opened, migrated or reconciled is *remembered*, not
+    // propagated here, and the run continues on the findings it already has. The
+    // store is a side channel — it enriches each finding with its history
+    // (`status`, `times_seen`, `first_seen`, live validation) and keeps the audit
+    // row of the run — while the findings themselves are collected without it. So
+    // a failure here costs the enrichment, and losing the enrichment of a scan
+    // that already found secrets is strictly better than losing the whole report:
+    // the reports, metrics, alerts and checkpoint are written regardless, and the
+    // remembered error is returned at the very end, so the exit code still says
+    // "store" (5) and the failure is never swallowed.
+    //
+    // The findings that reach the emission below therefore carry `status: New`
+    // and no history when the store was unavailable — an understatement of what
+    // the database knows, never a false claim: a finding is reported, and whether
+    // it is new is what the missing database cannot answer.
     let started_at_rfc3339 = started_at
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_default();
-    let store = if let Some(db_url) = config.db_url() {
-        let store = crate::store::FindingsStore::open(&db_url).await?;
-        store.migrate().await?;
-        Some(store)
-    } else {
-        None
+    let mut store_error: Option<ScannerError> = None;
+    let store = match open_store(&config).await {
+        Ok(store) => store,
+        Err(e) => {
+            warn!(
+                error = %e,
+                "Findings store unavailable: continuing without status history and live validation"
+            );
+            store_error = Some(e);
+            None
+        }
     };
     if let Some(ref store) = store {
-        findings = store
+        match store
             .reconcile(
                 &findings,
                 &scanned_issue_keys,
                 &scan_id,
                 &started_at_rfc3339,
             )
-            .await?;
+            .await
+        {
+            Ok(reconciled) => findings = reconciled,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "Findings store reconcile failed: reporting the findings without their history"
+                );
+                store_error = Some(e);
+            }
+        }
     }
 
     // Count findings by severity
@@ -319,12 +350,42 @@ pub async fn run(
         "Scan complete"
     );
 
-    // Record the scan into the findings store audit table.
+    // Record the scan into the findings store audit table. The reports are on
+    // disk by now, so a failure here is remembered like the ones above instead of
+    // taking the run down mid-way.
     if let Some(ref store) = store {
-        store.record_scan(&scan_run).await?;
+        if let Err(e) = store.record_scan(&scan_run).await {
+            warn!(error = %e, "Failed to record the scan in the findings store");
+            if store_error.is_none() {
+                store_error = Some(e);
+            }
+        }
+    }
+
+    // Everything the scan produced has been written. Only now does a store
+    // failure become the exit code (5): the operator still sees that the database
+    // was unavailable, and the reports of the run are not the price of it.
+    if let Some(e) = store_error {
+        return Err(e);
     }
 
     Ok(std::process::ExitCode::from(0))
+}
+
+/// Open and migrate the findings store, if one is configured.
+///
+/// `Ok(None)` means "the store is disabled" (no `--db-url` and no state
+/// directory) and is not a failure; any `Err` is a store that was asked for and
+/// could not be prepared. The caller decides what a failure costs — see the
+/// comment at the call site: the pipeline keeps going without the store and
+/// returns the error at the end.
+async fn open_store(config: &Config) -> Result<Option<crate::store::FindingsStore>, ScannerError> {
+    let Some(db_url) = config.db_url() else {
+        return Ok(None);
+    };
+    let store = crate::store::FindingsStore::open(&db_url).await?;
+    store.migrate().await?;
+    Ok(Some(store))
 }
 
 /// Collect one finished task from the JoinSet. Returns true if a task was
