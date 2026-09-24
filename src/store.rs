@@ -3,13 +3,13 @@
 //!
 //! Backed by `sqlx::Any` so the same code targets SQLite (local) and
 //! PostgreSQL (deployment). Identity of a stored finding is the deterministic
-//! `fingerprint(secret_hash, rule_id, issue_key)`; per-issue granularity lets
-//! the reconciler close secrets that vanish from a re-scanned issue while
-//! leaving unscanned issues untouched.
+//! [`FindingKey::fingerprint`] (`secret_hash`, `rule_id`, `issue_key`) — a UUID
+//! `finding_id` is regenerated every scan and must never be used as a key.
+//! Per-issue granularity lets the reconciler close secrets that vanish from a
+//! re-scanned issue while leaving unscanned issues untouched.
 
 use std::collections::{HashMap, HashSet};
 
-use sha2::{Digest, Sha256};
 use sqlx::any::{Any, AnyPoolOptions, AnyRow};
 use sqlx::Pool;
 use sqlx::Row;
@@ -18,8 +18,8 @@ use time::OffsetDateTime;
 
 use crate::error::ScannerError;
 use crate::finding::{
-    Confidence, ExternalValidation, Finding, FindingStatus, Location, ScanRun, ScanStatus,
-    Severity, SourceType,
+    Confidence, ExternalValidation, Finding, FindingKey, FindingStatus, Location, ScanRun,
+    ScanStatus, Severity, SourceType,
 };
 
 pub struct FindingsStore {
@@ -53,16 +53,6 @@ struct StoredRow {
 /// Deterministic primary key for a finding per (secret_hash, rule_id, issue_key).
 ///
 /// `finding_id` (UUID v4) is regenerated each scan and is NOT a stable key.
-fn fingerprint(secret_hash: &str, rule_id: &str, issue_key: &str) -> String {
-    let mut h = Sha256::new();
-    h.update(secret_hash.as_bytes());
-    h.update(b"\x1f");
-    h.update(rule_id.as_bytes());
-    h.update(b"\x1f");
-    h.update(issue_key.as_bytes());
-    format!("fp:{:x}", h.finalize())
-}
-
 fn now_rfc3339() -> String {
     OffsetDateTime::now_utc()
         .format(&Rfc3339)
@@ -259,22 +249,16 @@ impl FindingsStore {
         // --- Expand current findings to per-(hash, rule, issue) rows ---
         let mut exps: Vec<Exp> = Vec::new();
         for f in current {
-            let locs: Vec<Location> = if f.locations.is_empty() {
-                vec![Location {
-                    issue_key: f.issue_key.clone(),
-                    field_path: f.field_path.clone(),
-                    source_type: f.source_type,
-                }]
-            } else {
-                f.locations.clone()
-            };
+            // Explicit locations, or the finding's own issue when it has none:
+            // the same expansion the enrichment below keys off.
+            let locs: Vec<Location> = f.effective_locations();
             for loc in &locs {
                 let loc_json =
                     serde_json::to_string(&vec![loc.clone()]).unwrap_or_else(|_| "[]".into());
                 let refs_json =
                     serde_json::to_string(&f.references).unwrap_or_else(|_| "[]".into());
                 exps.push(Exp {
-                    fp: fingerprint(&f.secret_hash, &f.rule_id, &loc.issue_key),
+                    fp: FindingKey::new(&f.secret_hash, &f.rule_id, &loc.issue_key).fingerprint(),
                     secret_hash: f.secret_hash.clone(),
                     rule_id: f.rule_id.clone(),
                     issue_key: loc.issue_key.clone(),
@@ -480,8 +464,13 @@ impl FindingsStore {
             let mut nf = f.clone();
             let mut first_seen_min: Option<String> = None;
             let mut times_sum: u32 = 0;
-            for loc in &f.locations {
-                let fp = fingerprint(&f.secret_hash, &f.rule_id, &loc.issue_key);
+            // Enrich over exactly the rows written above (`location_keys()`
+            // carries the empty-`locations` fallback). Iterating `f.locations`
+            // directly used to skip a finding that had no explicit location
+            // list, reporting a stored, recurring finding as never-seen
+            // (`times_seen = 0`, `first_seen = now`, status `New`).
+            for key in f.location_keys() {
+                let fp = key.fingerprint();
                 let first_seen = match stored_by_fp.get(&fp) {
                     Some(s) => {
                         times_sum += (s.times_seen + 1) as u32;
@@ -643,7 +632,9 @@ mod tests {
         let url = format!("sqlite://{}?mode=rwc", db.display());
         // Parent directories do not exist yet; this previously failed with
         // SQLITE_CANTOPEN (code 14).
-        let store = FindingsStore::open(&url).await.expect("open creates parent dir");
+        let store = FindingsStore::open(&url)
+            .await
+            .expect("open creates parent dir");
         store.migrate().await.expect("migrate succeeds");
         assert!(db.is_file(), "database file should be created");
         let _ = std::fs::remove_dir_all(&base);
@@ -680,6 +671,18 @@ mod tests {
 
     fn keys(ks: &[&str]) -> HashSet<String> {
         ks.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// RFC3339 timestamp `secs` away from the wall clock.
+    ///
+    /// `first_seen` is stamped from the real clock during reconcile, so a scan
+    /// window has to be expressed relative to it: with a hardcoded date the test
+    /// silently flips from `Recurring` back to `New` once the wall clock passes
+    /// that literal.
+    fn scan_start_in(secs: i64) -> String {
+        (OffsetDateTime::now_utc() + time::Duration::seconds(secs))
+            .format(&Rfc3339)
+            .unwrap_or_default()
     }
 
     #[tokio::test]
@@ -726,14 +729,23 @@ mod tests {
         let store = fresh_store().await;
         let finding = make_finding("ghp_rec_secret_2", "github_token", "SEC-1");
         let scanned = keys(&["SEC-1"]);
+        // Scan windows relative to the wall clock: run 1 started before the
+        // finding was first seen, run 2 after it (see `scan_start_in`).
+        let first_window = scan_start_in(-86_400);
+        let second_window = scan_start_in(60);
         // First run → new.
         let out1 = store
-            .reconcile(std::slice::from_ref(&finding), &scanned, "scan-1", "2026-08-07T00:00:00Z")
+            .reconcile(
+                std::slice::from_ref(&finding),
+                &scanned,
+                "scan-1",
+                &first_window,
+            )
             .await
             .unwrap();
         // Second run (later started_at) → recurring, times_seen=2.
         let out = store
-            .reconcile(&[finding], &scanned, "scan-2", "2026-08-08T00:00:00Z")
+            .reconcile(&[finding], &scanned, "scan-2", &second_window)
             .await
             .unwrap();
         assert_eq!(out.len(), 1);
@@ -749,6 +761,115 @@ mod tests {
                 .unwrap();
         assert_eq!(status, "recurring");
         assert_eq!(times, 2);
+    }
+
+    /// A finding with no explicit `locations` is persisted under a location
+    /// synthesized from its own issue key. Enrichment must key off that same
+    /// row: it used to iterate `finding.locations` directly, so a stored,
+    /// recurring finding came back as `times_seen = 0`, `first_seen = now` and
+    /// status `New`.
+    #[tokio::test]
+    async fn reconcile_empty_locations_is_enriched_from_own_row() {
+        let store = fresh_store().await;
+        let mut finding = make_finding("ghp_no_locations_7", "github_token", "SEC-7");
+        finding.locations.clear();
+        let fallback = finding.key();
+
+        let scanned = keys(&["SEC-7"]);
+        let out1 = store
+            .reconcile(
+                std::slice::from_ref(&finding),
+                &scanned,
+                "scan-1",
+                &scan_start_in(-86_400),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out1.len(), 1);
+        assert_eq!(out1[0].times_seen, Some(1));
+        assert_eq!(out1[0].status, FindingStatus::New);
+        let first_seen = out1[0].first_seen.clone().expect("first_seen");
+
+        // Exactly one row, keyed by the finding's own location key.
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM findings")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 1);
+        let (fp, status, times): (String, String, i64) =
+            sqlx::query_as("SELECT fingerprint, status, times_seen FROM findings")
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        assert_eq!(fp, fallback.fingerprint());
+        assert_eq!(status, "new");
+        assert_eq!(times, 1);
+
+        // Second scan sees the same finding again → recurring, counted, and
+        // first_seen carried over from the first row.
+        let out2 = store
+            .reconcile(
+                std::slice::from_ref(&finding),
+                &scanned,
+                "scan-2",
+                &scan_start_in(60),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out2.len(), 1);
+        assert_eq!(out2[0].status, FindingStatus::Recurring);
+        assert_eq!(out2[0].times_seen, Some(2));
+        assert_eq!(out2[0].first_seen.as_deref(), Some(first_seen.as_str()));
+
+        let times: i64 = sqlx::query_scalar("SELECT times_seen FROM findings")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(times, 2);
+    }
+
+    /// Two locations of one finding in the SAME issue share a fingerprint; the
+    /// write path must emit one row, and enrichment must count it once.
+    #[tokio::test]
+    async fn reconcile_duplicate_location_fingerprints_share_one_row() {
+        let store = fresh_store().await;
+        let mut finding = make_finding("ghp_dup_location_8", "github_token", "SEC-8");
+        finding.locations = vec![
+            Location {
+                issue_key: "SEC-8".into(),
+                field_path: "fields.description".into(),
+                source_type: SourceType::Description,
+            },
+            Location {
+                issue_key: "SEC-8".into(),
+                field_path: "comment[1].body".into(),
+                source_type: SourceType::Comment,
+            },
+        ];
+        assert_eq!(finding.location_keys().len(), 2);
+        assert_eq!(
+            finding.location_keys()[0].fingerprint(),
+            finding.location_keys()[1].fingerprint()
+        );
+
+        let out = store
+            .reconcile(
+                &[finding],
+                &keys(&["SEC-8"]),
+                "scan-1",
+                &scan_start_in(-86_400),
+            )
+            .await
+            .unwrap();
+        assert_eq!(out.len(), 1);
+        // One persisted row, and the enrichment double-counts it once per
+        // location — the pre-existing arithmetic, unchanged by this refactor.
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM findings")
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 1);
+        assert_eq!(out[0].times_seen, Some(2));
     }
 
     #[tokio::test]
@@ -837,13 +958,21 @@ mod tests {
             .unwrap();
 
         let out = store
-            .reconcile(&[finding], &keys(&["SEC-1"]), "scan-1", "2026-08-07T00:00:00Z")
+            .reconcile(
+                &[finding],
+                &keys(&["SEC-1"]),
+                "scan-1",
+                "2026-08-07T00:00:00Z",
+            )
             .await
             .unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].severity, Severity::Critical);
         assert_eq!(out[0].confidence, Confidence::High);
-        let ev = out[0].external_validation.as_ref().expect("external validation");
+        let ev = out[0]
+            .external_validation
+            .as_ref()
+            .expect("external validation");
         assert!(ev.valid);
         assert_eq!(ev.source, "ext-sys");
 
@@ -877,7 +1006,12 @@ mod tests {
             .unwrap();
 
         let out = store
-            .reconcile(&[finding], &keys(&["SEC-1"]), "scan-1", "2026-08-07T00:00:00Z")
+            .reconcile(
+                &[finding],
+                &keys(&["SEC-1"]),
+                "scan-1",
+                "2026-08-07T00:00:00Z",
+            )
             .await
             .unwrap();
         assert_eq!(out.len(), 1);
