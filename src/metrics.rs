@@ -1,64 +1,37 @@
 use std::fs;
 use std::path::Path;
-use std::sync::atomic::AtomicU64;
 
+use crate::config::MetricsFormat;
 use crate::error::ScannerError;
 use crate::finding::ScanRun;
 
-/// In-process metrics counters (spec §16).
-pub struct Metrics {
-    pub scan_started_total: AtomicU64,
-    pub scan_completed_total: AtomicU64,
-    pub scan_failed_total: AtomicU64,
-    pub issues_scanned_total: AtomicU64,
-    pub findings_total: AtomicU64,
-    pub findings_by_severity_critical: AtomicU64,
-    pub findings_by_severity_high: AtomicU64,
-    pub findings_by_severity_medium: AtomicU64,
-    pub findings_by_severity_low: AtomicU64,
-    pub comments_scanned_total: AtomicU64,
-    pub attachments_scanned_total: AtomicU64,
-    pub errors_total: AtomicU64,
-    pub jira_rate_limited_total: AtomicU64,
-    pub scan_duration_seconds: AtomicU64,
-}
-
-impl Metrics {
-    pub fn new() -> Self {
-        Self {
-            scan_started_total: AtomicU64::new(0),
-            scan_completed_total: AtomicU64::new(0),
-            scan_failed_total: AtomicU64::new(0),
-            issues_scanned_total: AtomicU64::new(0),
-            findings_total: AtomicU64::new(0),
-            findings_by_severity_critical: AtomicU64::new(0),
-            findings_by_severity_high: AtomicU64::new(0),
-            findings_by_severity_medium: AtomicU64::new(0),
-            findings_by_severity_low: AtomicU64::new(0),
-            comments_scanned_total: AtomicU64::new(0),
-            attachments_scanned_total: AtomicU64::new(0),
-            errors_total: AtomicU64::new(0),
-            jira_rate_limited_total: AtomicU64::new(0),
-            scan_duration_seconds: AtomicU64::new(0),
+/// Write metrics to a file in the requested format.
+///
+/// The parent directory of `path` is created when missing: a scan configured
+/// with `--metrics-path /var/lib/jiraleaks/metrics.json` used to fail at its very
+/// last step — after the reports were written — just because the directory did
+/// not exist yet.
+pub fn write_metrics(
+    path: &Path,
+    format: MetricsFormat,
+    scan_run: &ScanRun,
+) -> Result<(), ScannerError> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent).map_err(|e| {
+                ScannerError::ReportWrite(format!(
+                    "Failed to create metrics directory '{}': {e}",
+                    parent.display()
+                ))
+            })?;
         }
     }
-}
 
-impl Default for Metrics {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Write metrics to a file in the specified format.
-pub fn write_metrics(path: &Path, format: &str, scan_run: &ScanRun) -> Result<(), ScannerError> {
+    // Exhaustive on purpose: a new format must not fall back to another writer
+    // silently, which is how `--metrics-format text` used to produce JSON.
     match format {
-        "json" => write_metrics_json(path, scan_run),
-        "prom" => write_metrics_prometheus(path, scan_run),
-        _ => {
-            tracing::warn!(format, "Unknown metrics format, using json");
-            write_metrics_json(path, scan_run)
-        }
+        MetricsFormat::Json => write_metrics_json(path, scan_run),
+        MetricsFormat::Prometheus => write_metrics_prometheus(path, scan_run),
     }
 }
 
@@ -129,4 +102,90 @@ fn write_metrics_prometheus(path: &Path, scan_run: &ScanRun) -> Result<(), Scann
     })?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::finding::ScanStatus;
+
+    fn scan_run() -> ScanRun {
+        ScanRun {
+            scan_id: "scan-1".into(),
+            status: ScanStatus::Success,
+            started_at: "2026-01-01T00:00:00Z".into(),
+            finished_at: "2026-01-01T00:00:01Z".into(),
+            jira_url: "https://jira.example.com".into(),
+            jql: "project = SEC".into(),
+            issues_scanned: 2,
+            issues_total: 2,
+            findings_total: 1,
+            findings_critical: 0,
+            findings_high: 1,
+            findings_medium: 0,
+            findings_low: 0,
+            findings_info: 0,
+            errors_total: 0,
+            comments_scanned: 0,
+            attachments_scanned: 0,
+            scanner_version: "0.1.0".into(),
+            duration_secs: 1.0,
+        }
+    }
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("jiraleaks-metrics-{name}-{}", std::process::id()))
+    }
+
+    /// The missing parent directory is created instead of failing the scan after
+    /// the reports were already written.
+    #[test]
+    fn creates_missing_parent_directory() {
+        let dir = temp_dir("nested");
+        let _ = fs::remove_dir_all(&dir);
+        let path = dir.join("deep").join("metrics.json");
+
+        write_metrics(&path, MetricsFormat::Json, &scan_run()).expect("metrics write");
+
+        let written = fs::read_to_string(&path).expect("metrics file exists");
+        assert!(written.contains("\"issues_scanned\": 2"), "got {written}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prometheus_format_writes_exposition_lines() {
+        let dir = temp_dir("prom");
+        let _ = fs::remove_dir_all(&dir);
+        let path = dir.join("metrics.prom");
+
+        write_metrics(&path, MetricsFormat::Prometheus, &scan_run()).expect("metrics write");
+
+        let written = fs::read_to_string(&path).expect("metrics file exists");
+        assert!(
+            written.contains("jiraleaks_findings_total{scan_id=\"scan-1\"} 1"),
+            "got {written}"
+        );
+        assert!(
+            written.contains("jiraleaks_issues_scanned{scan_id=\"scan-1\"} 2"),
+            "got {written}"
+        );
+        assert!(
+            !written.contains("\"issues_scanned\""),
+            "the Prometheus writer must not emit JSON: {written}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A bare filename has no parent directory to create and must not fail.
+    #[test]
+    fn relative_file_name_without_parent_is_written() {
+        let dir = temp_dir("bare");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("metrics-bare.json");
+
+        write_metrics(&path, MetricsFormat::Json, &scan_run()).expect("metrics write");
+        assert!(path.is_file());
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

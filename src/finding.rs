@@ -11,6 +11,62 @@ pub enum Severity {
     Critical,
 }
 
+impl Severity {
+    /// Parse a severity name, case-insensitively.
+    ///
+    /// **Lenient by contract**: an unknown or empty value yields
+    /// [`Severity::Medium`], it never fails. This is the behaviour the scanner
+    /// has always had for rule output — `severity` is free-form text in a user
+    /// rules file — and it must stay that way, because a typo in a custom rule
+    /// must not abort a scan. Use [`Severity::parse_opt`] where an unknown value
+    /// has to be detected (configuration validation does).
+    pub fn parse(s: &str) -> Self {
+        Self::parse_opt(s).unwrap_or(Severity::Medium)
+    }
+
+    /// Strict counterpart of [`Severity::parse`]: `None` for an unknown value.
+    pub fn parse_opt(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "critical" => Some(Severity::Critical),
+            "high" => Some(Severity::High),
+            "medium" => Some(Severity::Medium),
+            "low" => Some(Severity::Low),
+            "info" => Some(Severity::Info),
+            _ => None,
+        }
+    }
+
+    /// Canonical lowercase name, the spelling used by JSON reports and by the
+    /// rules files.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Severity::Critical => "critical",
+            Severity::High => "high",
+            Severity::Medium => "medium",
+            Severity::Low => "low",
+            Severity::Info => "info",
+        }
+    }
+}
+
+impl std::str::FromStr for Severity {
+    /// Infallible: the lenient contract of [`Severity::parse`] has no error case,
+    /// because an unknown severity must default rather than fail. Prefer the
+    /// explicit [`Severity::parse`]; this impl only makes `"high".parse()`
+    /// available for generic code.
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Severity::parse(s))
+    }
+}
+
+impl std::fmt::Display for Severity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Confidence levels for findings (spec §10.11).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -18,6 +74,53 @@ pub enum Confidence {
     Low,
     Medium,
     High,
+}
+
+impl Confidence {
+    /// Parse a confidence name, case-insensitively.
+    ///
+    /// **Lenient by contract**: an unknown or empty value yields
+    /// [`Confidence::Low`], it never fails — same reasoning as
+    /// [`Severity::parse`]. Use [`Confidence::parse_opt`] where an unknown value
+    /// has to be detected.
+    pub fn parse(s: &str) -> Self {
+        Self::parse_opt(s).unwrap_or(Confidence::Low)
+    }
+
+    /// Strict counterpart of [`Confidence::parse`]: `None` for an unknown value.
+    pub fn parse_opt(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "high" => Some(Confidence::High),
+            "medium" => Some(Confidence::Medium),
+            "low" => Some(Confidence::Low),
+            _ => None,
+        }
+    }
+
+    /// Canonical lowercase name, the spelling used by JSON reports and by the
+    /// rules files.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Confidence::High => "high",
+            Confidence::Medium => "medium",
+            Confidence::Low => "low",
+        }
+    }
+}
+
+impl std::str::FromStr for Confidence {
+    /// Infallible: see [`Severity`]'s impl — the lenient parse has no error case.
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Confidence::parse(s))
+    }
+}
+
+impl std::fmt::Display for Confidence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 /// Source type indicating where a finding was detected.

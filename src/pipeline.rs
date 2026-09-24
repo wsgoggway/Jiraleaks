@@ -48,7 +48,9 @@ pub async fn run(
     let client = Arc::new(client);
     let fetcher = Arc::new(Fetcher::new(client.clone(), config.clone()));
     let extractor = TextExtractor::new(config.max_text_size_kb);
-    let credpair_detector = CredentialPairDetector;
+    // Startup check: the credential-pair patterns are compiled once here rather
+    // than silently skipped at detection time.
+    let credpair_detector = CredentialPairDetector::new()?;
     let dedup = Deduplicator::new();
 
     let cancel = CancellationToken::new();
@@ -87,10 +89,7 @@ pub async fn run(
         )
         .expect("valid indicatif template"),
     );
-    let mut progress = ScanProgress::new();
-    progress.set_bar(bar);
-    let progress = Arc::new(progress);
-
+    let progress = Arc::new(ScanProgress::with_bar(bar));
     let (mut issue_rx, fetch_handle) = fetcher
         .fetch_issues_stream(jql, cancel.clone(), progress.clone())
         .await;
@@ -235,6 +234,10 @@ pub async fn run(
             .unwrap_or_default(),
         jira_url: config.jira_url.clone(),
         jql: jql.to_string(),
+        // `issues_done` counts finished attempts: an issue whose processing
+        // failed is counted here too (and again in `errors_total`), so
+        // `issues_scanned` is "issues attempted", not "issues scanned
+        // successfully". See `progress.rs` for the counter semantics.
         issues_scanned: progress.issues_done.load(Ordering::Relaxed),
         issues_total: progress.issues_total.load(Ordering::Relaxed),
         findings_total: findings.len() as u64,
@@ -257,7 +260,7 @@ pub async fn run(
 
     // Write metrics if configured
     if let Some(ref metrics_path) = config.metrics_path {
-        crate::metrics::write_metrics(metrics_path, &config.metrics_format, &scan_run)?;
+        crate::metrics::write_metrics(metrics_path, config.metrics_format, &scan_run)?;
     }
 
     // Send alerts if configured
@@ -426,14 +429,14 @@ async fn process_issue(
 
             // Confidence adjustment
             let confidence = finding::adjust_confidence(
-                parse_confidence(&hit.confidence),
+                Confidence::parse(&hit.confidence),
                 has_context,
                 crate::entropy::shannon(&hit.matched_value) > 3.5,
                 is_placeholder,
             );
 
             // Filter by min-confidence
-            if confidence < parse_confidence(&config.min_confidence) {
+            if confidence < Confidence::parse(&config.min_confidence) {
                 continue;
             }
 
@@ -448,7 +451,7 @@ async fn process_issue(
                 issue_url: issue_url.clone(),
                 field_path: hit.field_path.clone(),
                 rule_id: hit.rule_id.clone(),
-                severity: parse_severity(&hit.severity),
+                severity: Severity::parse(&hit.severity),
                 confidence,
                 redacted_secret: redacted,
                 secret_hash,
@@ -481,8 +484,8 @@ async fn process_issue(
                 break;
             }
 
-            let confidence = parse_confidence("high");
-            if confidence < parse_confidence(&config.min_confidence) {
+            let confidence = Confidence::parse("high");
+            if confidence < Confidence::parse(&config.min_confidence) {
                 continue;
             }
 
@@ -527,22 +530,22 @@ async fn process_issue(
     Ok(findings)
 }
 
+/// Legacy shim — use [`Severity::parse`] or `Severity::from_str` from
+/// [`crate::finding`] instead.
+///
+/// Kept only while the call sites outside this module migrate; it delegates
+/// verbatim, so behaviour is identical. No `#[deprecated]` attribute on purpose:
+/// emitting a warning from another team's code during a parallel migration is
+/// noise, not a signal.
 pub fn parse_severity(s: &str) -> Severity {
-    match s.to_lowercase().as_str() {
-        "critical" => Severity::Critical,
-        "high" => Severity::High,
-        "medium" => Severity::Medium,
-        "low" => Severity::Low,
-        "info" => Severity::Info,
-        _ => Severity::Medium,
-    }
+    Severity::parse(s)
 }
 
+/// Legacy shim — use [`Confidence::parse`] or `Confidence::from_str` from
+/// [`crate::finding`] instead.
+///
+/// Same delegation and same deliberate absence of `#[deprecated]` as
+/// [`parse_severity`].
 pub fn parse_confidence(s: &str) -> Confidence {
-    match s.to_lowercase().as_str() {
-        "high" => Confidence::High,
-        "medium" => Confidence::Medium,
-        "low" => Confidence::Low,
-        _ => Confidence::Low,
-    }
+    Confidence::parse(s)
 }
