@@ -24,7 +24,7 @@ use jiraleaks::credpair::CredentialPairDetector;
 use jiraleaks::finding::{
     Confidence, Finding, FindingStatus, ScanRun, ScanStatus, Severity, SourceType,
 };
-use jiraleaks::report::{csv as csv_report, summary};
+use jiraleaks::report::{csv as csv_report, summary, ReportInput};
 use jiraleaks::sanitize;
 
 /// The pipeline checks `max_findings_per_issue` only after a segment has been
@@ -176,7 +176,15 @@ fn hostile_text_cannot_control_the_summary_report() {
     );
     let path = temp_path("txt");
 
-    summary::write(&path, &scan_run(), &[finding]).expect("summary write");
+    let run = scan_run();
+    summary::write(
+        &path,
+        &ReportInput {
+            scan_run: &run,
+            findings: &[finding],
+        },
+    )
+    .expect("summary write");
     let content = std::fs::read_to_string(&path).expect("read summary");
     let _ = std::fs::remove_file(&path);
 
@@ -205,7 +213,15 @@ fn hostile_snippet_cannot_inject_a_spreadsheet_formula() {
     let finding = hostile_finding(snippet, "+1+1", "@SUM(A1)");
     let path = temp_path("csv");
 
-    csv_report::write(&path, &[finding]).expect("csv write");
+    let run = scan_run();
+    csv_report::write(
+        &path,
+        &ReportInput {
+            scan_run: &run,
+            findings: &[finding],
+        },
+    )
+    .expect("csv write");
     let mut reader = csv::Reader::from_path(&path).expect("csv reader");
     let rows: Vec<csv::StringRecord> = reader.records().map(|r| r.expect("record")).collect();
     let _ = std::fs::remove_file(&path);

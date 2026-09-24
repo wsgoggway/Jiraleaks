@@ -17,11 +17,52 @@ use std::collections::HashSet;
 
 use jiraleaks::dedup::Deduplicator;
 use jiraleaks::finding::{
-    Confidence, Finding, FindingKey, FindingStatus, Location, MergeKey, Severity, SourceType,
+    Confidence, Finding, FindingKey, FindingStatus, Location, MergeKey, ScanRun, ScanStatus,
+    Severity, SourceType,
 };
 use jiraleaks::hash::secret_hash;
-use jiraleaks::report::defectdojo;
+use jiraleaks::report::{defectdojo, ReportInput};
 use jiraleaks::store::FindingsStore;
+
+/// The DefectDojo writer reads only its findings; the scan metadata is there because
+/// every report writer shares one signature.
+fn scan_run() -> ScanRun {
+    ScanRun {
+        scan_id: "scan-1".into(),
+        status: ScanStatus::Success,
+        started_at: "2026-01-01T00:00:00Z".into(),
+        finished_at: "2026-01-01T00:00:01Z".into(),
+        jira_url: "https://jira.example.com".into(),
+        jql: "project = SEC".into(),
+        issues_scanned: 0,
+        issues_total: 0,
+        findings_total: 0,
+        findings_critical: 0,
+        findings_high: 0,
+        findings_medium: 0,
+        findings_low: 0,
+        findings_info: 0,
+        errors_total: 0,
+        comments_scanned: 0,
+        attachments_scanned: 0,
+        scanner_version: "0.1.0".into(),
+        duration_secs: 0.0,
+    }
+}
+
+fn write_defectdojo(
+    path: &std::path::Path,
+    findings: &[Finding],
+) -> Result<(), jiraleaks::error::ScannerError> {
+    let run = scan_run();
+    defectdojo::write(
+        path,
+        &ReportInput {
+            scan_run: &run,
+            findings,
+        },
+    )
+}
 
 /// Secret value whose whole identity chain is pinned below.
 const GOLDEN_SECRET: &str = "ghp_golden_secret";
@@ -262,14 +303,14 @@ fn defectdojo_id_survives_rescans_and_separates_locations() {
     let scan2 = dir.join("scan2.json");
     let report = finding(GOLDEN_SECRET, "github_token", "SEC-1");
     let expected = format!("{GOLDEN_FINGERPRINT}#0");
-    defectdojo::write(&scan1, std::slice::from_ref(&report)).unwrap();
-    defectdojo::write(&scan2, &[finding(GOLDEN_SECRET, "github_token", "SEC-1")]).unwrap();
+    write_defectdojo(&scan1, std::slice::from_ref(&report)).unwrap();
+    write_defectdojo(&scan2, &[finding(GOLDEN_SECRET, "github_token", "SEC-1")]).unwrap();
     assert_eq!(read_id(&scan1), expected);
     assert_eq!(read_id(&scan2), expected);
 
     // A different location is a different record.
     let elsewhere = dir.join("scan3.json");
-    defectdojo::write(
+    write_defectdojo(
         &elsewhere,
         &[finding(GOLDEN_SECRET, "github_token", "SEC-3")],
     )

@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 
 use crate::error::ScannerError;
-use crate::finding::{Finding, ScanRun};
+use crate::report::ReportInput;
 use crate::sanitize;
 
 /// Write a human-readable summary text report.
@@ -11,7 +11,9 @@ use crate::sanitize;
 /// Jira content is passed through [`sanitize::terminal`]: without it an attachment
 /// called `\x1b[2K\x1b[32mCLEAN` could repaint the operator's screen, and an OSC 52
 /// sequence in a comment would write to their clipboard.
-pub fn write(path: &Path, scan_run: &ScanRun, findings: &[Finding]) -> Result<(), ScannerError> {
+pub fn write(path: &Path, input: &ReportInput<'_>) -> Result<(), ScannerError> {
+    let scan_run = input.scan_run;
+    let findings = input.findings;
     let mut out = String::new();
 
     out.push_str("=== Jira Secret Scanner — Scan Summary ===\n\n");
@@ -132,7 +134,7 @@ pub fn write(path: &Path, scan_run: &ScanRun, findings: &[Finding]) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::finding::{Confidence, FindingStatus, Severity, SourceType};
+    use crate::finding::{Confidence, Finding, FindingStatus, ScanRun, Severity, SourceType};
 
     fn scan_run() -> ScanRun {
         ScanRun {
@@ -186,7 +188,14 @@ mod tests {
     fn write_to_temp(findings: &[Finding], name: &str) -> String {
         let path = std::env::temp_dir().join(format!("jiraleaks_summary_{name}.txt"));
         let _ = std::fs::remove_file(&path);
-        write(&path, &scan_run(), findings).expect("summary write");
+        write(
+            &path,
+            &ReportInput {
+                scan_run: &scan_run(),
+                findings,
+            },
+        )
+        .expect("summary write");
         let content = std::fs::read_to_string(&path).expect("read summary");
         let _ = std::fs::remove_file(&path);
         content

@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use crate::error::ScannerError;
-use crate::finding::Finding;
+use crate::report::ReportInput;
 use crate::sanitize;
 
 /// Write findings as a flat CSV table.
@@ -11,7 +11,8 @@ use crate::sanitize;
 /// snippet starting with `=` would otherwise be evaluated as a spreadsheet formula
 /// when the report is opened. Columns derived from enums or numbers are written as
 /// they are.
-pub fn write(path: &Path, findings: &[Finding]) -> Result<(), ScannerError> {
+pub fn write(path: &Path, input: &ReportInput<'_>) -> Result<(), ScannerError> {
+    let findings = input.findings;
     let mut wtr = csv::Writer::from_path(path)
         .map_err(|e| ScannerError::ReportWrite(format!("CSV writer creation error: {e}")))?;
 
@@ -85,7 +86,7 @@ pub fn write(path: &Path, findings: &[Finding]) -> Result<(), ScannerError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::finding::{Confidence, FindingStatus, Severity, SourceType};
+    use crate::finding::{Confidence, Finding, FindingStatus, ScanRun, Severity, SourceType};
 
     /// A finding whose every free-text field carries hostile content.
     fn hostile_finding() -> Finding {
@@ -116,8 +117,39 @@ mod tests {
     fn write_to_temp(findings: &[Finding], name: &str) -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!("jiraleaks_csv_{name}.csv"));
         let _ = std::fs::remove_file(&path);
-        write(&path, findings).expect("csv write");
+        write(
+            &path,
+            &ReportInput {
+                scan_run: &scan_run(),
+                findings,
+            },
+        )
+        .expect("csv write");
         path
+    }
+
+    fn scan_run() -> ScanRun {
+        ScanRun {
+            scan_id: "test".into(),
+            status: crate::finding::ScanStatus::Success,
+            started_at: "2026-01-01T00:00:00Z".into(),
+            finished_at: "2026-01-01T00:00:01Z".into(),
+            jira_url: "https://jira.example.com".into(),
+            jql: "project = SEC".into(),
+            issues_scanned: 0,
+            issues_total: 0,
+            findings_total: 0,
+            findings_critical: 0,
+            findings_high: 0,
+            findings_medium: 0,
+            findings_low: 0,
+            findings_info: 0,
+            errors_total: 0,
+            comments_scanned: 0,
+            attachments_scanned: 0,
+            scanner_version: "test".into(),
+            duration_secs: 0.0,
+        }
     }
 
     #[test]
