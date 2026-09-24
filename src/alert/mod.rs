@@ -155,7 +155,7 @@ impl AlertsConfig {
     pub fn min_confidence(&self) -> Result<Confidence, ScannerError> {
         let raw = self.min_confidence.trim();
         match raw.to_ascii_lowercase().as_str() {
-            "low" | "medium" | "high" => Ok(crate::pipeline::parse_confidence(raw)),
+            "low" | "medium" | "high" => Ok(Confidence::parse(raw)),
             _ => Err(ScannerError::Config(format!(
                 "alerts config: invalid min_confidence {raw:?} (expected low, medium or high)"
             ))),

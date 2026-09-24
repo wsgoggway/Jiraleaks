@@ -385,18 +385,6 @@ fn is_placeholder(value: &str) -> bool {
 /// copy of the dictionary in [`crate::candidate`] read in `Exact` mode.
 const PLACEHOLDERS: PlaceholderPolicy = PlaceholderPolicy::exact();
 
-/// Legacy wrapper for [`is_placeholder`], kept only for callers outside this
-/// module.
-///
-/// The pipeline no longer needs it — it judges candidates through
-/// [`crate::candidate::Judge`], which applies the same policy — so new code should
-/// use [`PlaceholderPolicy::exact`] (or the policy its own call site is specified
-/// to use) directly. Detection behaviour is identical to the pre-refactor
-/// function.
-pub fn is_placeholder_static(value: &str) -> bool {
-    is_placeholder(value)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -711,12 +699,14 @@ mod tests {
         assert!(hits.len() <= MAX_HITS_PER_SEGMENT);
     }
 
+    /// The policy the detector reads is the exact-equality one: dictionary words
+    /// and template markers are placeholders, a real-looking password is not.
     #[test]
-    fn test_is_placeholder_static_exposed() {
-        assert!(is_placeholder_static("changeme"));
-        assert!(is_placeholder_static("<password>"));
-        assert!(is_placeholder_static("${DB_PASS}"));
-        assert!(!is_placeholder_static("hunter2secret"));
+    fn test_placeholder_policy_is_exact_equality() {
+        assert!(PLACEHOLDERS.matches("changeme"));
+        assert!(PLACEHOLDERS.matches("<password>"));
+        assert!(PLACEHOLDERS.matches("${DB_PASS}"));
+        assert!(!PLACEHOLDERS.matches("hunter2secret"));
     }
 
     #[test]
@@ -735,9 +725,9 @@ mod tests {
             "hunter2secret",
         ] {
             assert_eq!(
-                is_placeholder_static(value),
+                is_placeholder(value),
                 PlaceholderPolicy::exact().matches(value),
-                "wrapper and policy disagree on {value}"
+                "detector policy and shared policy disagree on {value}"
             );
         }
     }
