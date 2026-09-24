@@ -260,6 +260,18 @@ fn field_scope_matches(scope: &str, field_path: &str) -> bool {
     }
 }
 
+/// The allowlist record that suppressed a finding.
+///
+/// Returned by [`AllowlistFilter::check`]: an allowlist entry matched, and this
+/// carries what the caller may want to report about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AllowlistMatch<'a> {
+    /// The entry's `reason` field — the operator's justification for the
+    /// suppression — when the entry has one. `None` means the entry suppresses
+    /// the finding without saying why; it is not a matching failure.
+    pub reason: Option<&'a str>,
+}
+
 /// Pre-compiled allowlist for fast matching.
 ///
 /// # Matching contract
@@ -287,11 +299,12 @@ fn field_scope_matches(scope: &str, field_path: &str) -> bool {
 ///
 /// The scope is compared with the finding's `field_path` — the extractor's path
 /// to the scanned text, built as `a.b[i].c` (`description`,
-/// `comment.comments[0].body`, `attachment:dump.txt`):
+/// `comment.comments[0].body`, `attachment[<name>]`):
 ///
 /// * the scope equals the path exactly (`field: comment` matches `comment`), or
 ///   is a prefix of it followed by `.` or `[`, i.e. a **subpath** (`field:
-///   comment` matches `comment.body` and `comment[0].text`);
+///   comment` matches `comment.body` and `comment[0].text`, and `field:
+///   attachment` matches `attachment[dump.txt]`);
 /// * consequently `field: comment` matches neither `comments`, `commentary` nor
 ///   `fields.comment`, and `field: description` never covers a comment.
 ///
@@ -376,18 +389,22 @@ impl AllowlistFilter {
         }
     }
 
-    /// Whether the finding is allowlisted.
+    /// The allowlist record that suppresses the finding, if any.
     ///
     /// `field_path` is the extractor's path to the scanned text (`a.b[i].c`,
-    /// e.g. `description`, `comment.comments[0].body`, `attachment:dump.txt`);
+    /// e.g. `description`, `comment.comments[0].body`, `attachment[<name>]`);
     /// see the type-level contract for how `field` scopes compare to it.
-    pub fn is_allowed(
+    ///
+    /// The returned [`AllowlistMatch`] carries the matched entry's audit `reason`,
+    /// so a caller that records *why* a finding was dropped can report the
+    /// operator's own words. The entry is logged, with its reason, as before.
+    pub fn check(
         &self,
         secret_value: &str,
         rule_id: &str,
         issue_key: &str,
         field_path: &str,
-    ) -> bool {
+    ) -> Option<AllowlistMatch<'_>> {
         let hash_hex = if self.has_hashes {
             let hashed = secret_hash(secret_value);
             Some(
@@ -417,11 +434,33 @@ impl AllowlistFilter {
                     reason = entry.reason.as_deref().unwrap_or("-"),
                     "Finding suppressed by allowlist"
                 );
-                return true;
+                return Some(AllowlistMatch {
+                    reason: entry.reason.as_deref(),
+                });
             }
         }
 
-        false
+        None
+    }
+
+    /// Whether the finding is allowlisted.
+    ///
+    /// A thin wrapper over [`AllowlistFilter::check`] for the callers that only
+    /// need the decision — the matching contract is identical, `true` exactly
+    /// when `check` returns `Some`.
+    ///
+    /// `field_path` is the extractor's path to the scanned text (`a.b[i].c`,
+    /// e.g. `description`, `comment.comments[0].body`, `attachment[<name>]`);
+    /// see the type-level contract for how `field` scopes compare to it.
+    pub fn is_allowed(
+        &self,
+        secret_value: &str,
+        rule_id: &str,
+        issue_key: &str,
+        field_path: &str,
+    ) -> bool {
+        self.check(secret_value, rule_id, issue_key, field_path)
+            .is_some()
     }
 }
 
@@ -592,5 +631,46 @@ mod tests {
         let f = filter("project_key: SEC\n");
         assert!(f.is_allowed("any", "r", "SEC-1", "description"));
         assert!(!f.is_allowed("any", "r", "OPS-1", "description"));
+    }
+
+    #[test]
+    fn check_reports_the_matching_entry_reason() {
+        let f = filter("value: SECRETVALUE123456\nreason: public docs example\n");
+        assert_eq!(
+            f.check("SECRETVALUE123456", "r", "SEC-1", "description")
+                .map(|m| m.reason),
+            Some(Some("public docs example"))
+        );
+
+        // An entry without a reason still matches: the finding is suppressed, and
+        // the caller is told there is no justification to quote.
+        let f = filter("value: SECRETVALUE123456\n");
+        assert_eq!(
+            f.check("SECRETVALUE123456", "r", "SEC-1", "description")
+                .map(|m| m.reason),
+            Some(None)
+        );
+
+        // No entry matches: no suppression at all.
+        assert_eq!(
+            f.check("OTHERVALUE1234567", "r", "SEC-1", "description"),
+            None
+        );
+    }
+
+    #[test]
+    fn is_allowed_is_check_is_some() {
+        let f = filter("pattern: '^ghp_example_'\nfield: comment\nreason: docs\n");
+        for (value, field) in [
+            ("ghp_example_abc", "comment.body"),
+            ("ghp_example_abc", "description"),
+            ("other", "comment.body"),
+        ] {
+            assert_eq!(
+                f.is_allowed(value, "r", "SEC-1", field),
+                f.check(value, "r", "SEC-1", field).is_some(),
+                "{value} in {field}"
+            );
+        }
     }
 }
