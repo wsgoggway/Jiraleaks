@@ -87,8 +87,9 @@ pub struct Config {
 
     /// Personal access token (or API token for basic auth).
     ///
-    /// Taken from the first of: `--pat`, `JIRA_PAT`, `JIRA_API_TOKEN` — see
-    /// [`Config::resolve_pat_from_env`].
+    /// Taken from the first of `--pat`, `JIRA_PAT`, `JIRA_API_TOKEN`; the
+    /// environment fallbacks are applied by `Config::resolve_pat_from_env`, which
+    /// the binary calls right after parsing.
     #[arg(long, default_value = "", hide_default_value = true)]
     pat: String,
 
