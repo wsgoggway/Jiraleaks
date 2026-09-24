@@ -25,6 +25,15 @@ lto = "thin"
 strip = true
 opt-level = 3
 
+[lints.rust]
+# This crate is pure safe Rust; keep it that way.
+unsafe_code = "forbid"
+
+[lints.clippy]
+# The default lint group, declared explicitly so local runs and CI agree.
+# priority = -1 puts the group below any individual lint override added later.
+all = { level = "warn", priority = -1 }
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "gzip", "blocking"] }
